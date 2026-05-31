@@ -278,7 +278,7 @@ export async function cancelarComanda(comandaId: string): Promise<void> {
 
 const CACHE_PRODUTOS_KEY = "sp_cache_produtos";
 const CACHE_CAT_KEY = "sp_cache_categorias";
-const CACHE_TTL = 5 * 60 * 1000; // 5 min
+const CACHE_TTL = 0; // sem cache — sempre busca fresco
 
 export async function getProdutos(): Promise<Produto[]> {
   // Tenta cache
