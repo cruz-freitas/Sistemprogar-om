@@ -60,46 +60,46 @@ export function useChamadasGarcom() {
   useEffect(() => {
     carregar();
 
-    // Realtime: escuta novas chamadas
-    const channel = supabase
-      .channel("chamadas-garcom-realtime")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "chamadas_garcom" },
-        (payload) => {
-          const nova = payload.new as ChamadaPendente;
-          if (nova.status !== "pendente") return; // já nasceu atendida
-          
-          setChamadas(prev => prev.find(c => c.id === nova.id) ? prev : [...prev, nova]);
-          setNovasChamadas(prev => [...prev, nova]);
-          tocarAlerta(3);
+    // Realtime: escuta novas chamadas — todos os listeners ANTES do subscribe()
+    const channel = supabase.channel("chamadas-garcom-realtime");
 
-          // Notificação do browser
-          if ("Notification" in window && Notification.permission === "granted") {
-            new Notification(`🔔 Mesa ${nova.mesa_numero} está chamando!`, {
-              body: nova.cliente_nome ? `Cliente: ${nova.cliente_nome}` : "Toque para atender",
-              icon: "/icon-192x192.png",
-            });
-          }
+    channel.on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "chamadas_garcom" },
+      (payload) => {
+        const nova = payload.new as ChamadaPendente;
+        if (nova.status !== "pendente") return;
 
-          // Remove da lista de "novas" após 25s
-          setTimeout(() => {
-            setNovasChamadas(prev => prev.filter(c => c.id !== nova.id));
-          }, 25000);
+        setChamadas(prev => prev.find(c => c.id === nova.id) ? prev : [...prev, nova]);
+        setNovasChamadas(prev => [...prev, nova]);
+        tocarAlerta(3);
+
+        if ("Notification" in window && Notification.permission === "granted") {
+          new Notification(`🔔 Mesa ${nova.mesa_numero} está chamando!`, {
+            body: nova.cliente_nome ? `Cliente: ${nova.cliente_nome}` : "Toque para atender",
+            icon: "/icon-192x192.png",
+          });
         }
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "chamadas_garcom" },
-        (payload) => {
-          const updated = payload.new as { id: string; status: string };
-          if (updated.status !== "pendente") {
-            setChamadas(prev => prev.filter(c => c.id !== updated.id));
-            setNovasChamadas(prev => prev.filter(c => c.id !== updated.id));
-          }
+
+        setTimeout(() => {
+          setNovasChamadas(prev => prev.filter(c => c.id !== nova.id));
+        }, 25000);
+      }
+    );
+
+    channel.on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "chamadas_garcom" },
+      (payload) => {
+        const updated = payload.new as { id: string; status: string };
+        if (updated.status !== "pendente") {
+          setChamadas(prev => prev.filter(c => c.id !== updated.id));
+          setNovasChamadas(prev => prev.filter(c => c.id !== updated.id));
         }
-      )
-      .subscribe();
+      }
+    );
+
+    channel.subscribe();
 
     channelRef.current = channel;
 
