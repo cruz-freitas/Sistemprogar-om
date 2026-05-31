@@ -332,11 +332,20 @@ export async function inserirItens(comandaId: string, itens: Array<{
 }
 
 export async function getItensDaComanda(comandaId: string): Promise<ComandaItem[]> {
+  // Se a comanda ainda tem ID temporário, só lê do local (ainda não está no banco)
+  if (isTempId(comandaId)) {
+    const local = await dbGetByIndex<ComandaItem>(STORES.comanda_itens, "comanda_id", comandaId);
+    return local.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+  }
+
   if (online()) {
     try {
       const { data, error } = await supabase
         .from("comanda_itens").select("*").eq("comanda_id", comandaId).order("created_at");
-      if (!error && data) { await dbPutMany(STORES.comanda_itens, data); return data as ComandaItem[]; }
+      if (!error && data) {
+        await dbPutMany(STORES.comanda_itens, data);
+        return data as ComandaItem[];
+      }
     } catch {}
   }
   const local = await dbGetByIndex<ComandaItem>(STORES.comanda_itens, "comanda_id", comandaId);
