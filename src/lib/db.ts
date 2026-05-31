@@ -269,10 +269,14 @@ export async function inserirItens(comandaId: string, itens: Array<{
     });
   }
 
-  if (online()) {
+  // Se a comanda ainda tem ID temporário (foi criada offline e ainda não sincronizou),
+  // NÃO tenta inserir online — vai direto para a fila.
+  // O sync vai resolver o ID da comanda primeiro, depois os itens.
+  const comandaEhTemp = isTempId(comandaId);
+
+  if (online() && !comandaEhTemp) {
     try {
       // Insere um por um para pegar o ID real de cada um
-      const inseridos: ComandaItem[] = [];
       for (const row of rows) {
         const { id: _id, ...payload } = row;
         const { data, error } = await supabase
@@ -283,10 +287,9 @@ export async function inserirItens(comandaId: string, itens: Array<{
 
         if (error) throw error;
 
-        // Substitui ID temporário pelo real
-        await dbDelete(STORES.comanda_itens, row.id);
+        // Salva real ANTES de apagar temp
         await dbPut(STORES.comanda_itens, data);
-        inseridos.push(data as ComandaItem);
+        await dbDelete(STORES.comanda_itens, row.id);
       }
 
       // Atualiza total da comanda com os dados reais do banco
@@ -303,12 +306,13 @@ export async function inserirItens(comandaId: string, itens: Array<{
       }
       return;
     } catch (err) {
-      console.error("[db] Erro ao inserir itens online, vai para fila:", err);
+      console.error("[db] Erro ao inserir itens online, enfileirando:", err);
       // NÃO apaga os locais — caem para a fila abaixo
     }
   }
 
-  // Offline ou falhou online: enfileira cada item (local já está salvo)
+  // Offline OU comanda tem ID temporário OU falhou online → enfileira
+  // Os itens ficam salvos no IndexedDB e serão enviados quando o sync rodar
   for (const row of rows) {
     await enfileirar({
       tabela: "comanda_itens",
