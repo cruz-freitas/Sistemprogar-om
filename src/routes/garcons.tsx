@@ -71,12 +71,20 @@ function Garcons() {
     setSaving(true);
 
     const payload: Record<string, unknown> = {
-      nome: form.nome,
+      nome: form.nome.trim(),
       usuario: form.usuario.trim().toLowerCase(),
       funcao: form.funcao,
       ativo: form.ativo,
     };
-    if (form.senha.trim()) payload.senha_hash = form.senha;
+
+    // Gera hash SHA-256 da senha antes de salvar
+    if (form.senha.trim()) {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(form.senha.trim());
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      payload.senha_hash = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+    }
 
     const { error } = editando
       ? await supabase.from("funcionarios").update(payload).eq("id", editando.id)
@@ -98,7 +106,7 @@ function Garcons() {
 
   // Usuário logado (para não deixar excluir a si mesmo)
   const sessao = (() => {
-    try { return JSON.parse(sessionStorage.getItem("funcionario") ?? "{}"); } catch { return {}; }
+    try { return JSON.parse(localStorage.getItem("sp_session_v2") || sessionStorage.getItem("sp_session_v2") || "{}"); } catch { return {}; }
   })();
 
   return (
