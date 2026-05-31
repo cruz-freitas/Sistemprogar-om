@@ -60,6 +60,7 @@ function GarcomApp() {
   // ─── State da aba Comanda (abertura de nova comanda) ─────────────────────
   const [fichaNumero, setFichaNumero] = useState("");
   const [fichaStatus, setFichaStatus] = useState<"idle" | "buscando" | "disponivel" | "ocupada">("idle");
+  const [comandaEncontrada, setComandaEncontrada] = useState<Comanda | null>(null);
   const [clienteNome, setClienteNome] = useState("");
   const [mesaSelecionadaId, setMesaSelecionadaId] = useState("");
   const [abrindo, setAbrindo] = useState(false);
@@ -188,9 +189,26 @@ function GarcomApp() {
   async function buscarFicha() {
     if (!fichaNumero.trim()) return;
     setFichaStatus("buscando");
+    setComandaEncontrada(null);
     try {
       const status = await verificarFicha(fichaNumero.trim());
-      setFichaStatus(status);
+
+      if (status === "ocupada") {
+        // Busca a comanda aberta com este código
+        const { data } = await import("@/lib/supabase").then(m =>
+          m.supabase
+            .from("comandas")
+            .select("*, mesas(numero)")
+            .eq("codigo", fichaNumero.trim())
+            .eq("status", "aberta")
+            .limit(1)
+        );
+        const cmd = data?.[0] ?? null;
+        setComandaEncontrada(cmd);
+        setFichaStatus("ocupada");
+      } else {
+        setFichaStatus("disponivel");
+      }
     } catch {
       toast.error("Erro ao verificar ficha. Tente novamente.");
       setFichaStatus("idle");
@@ -477,7 +495,7 @@ function GarcomApp() {
                 <Input
                   placeholder="Ex: 042"
                   value={fichaNumero}
-                  onChange={e => { setFichaNumero(e.target.value.replace(/\D/, "")); setFichaStatus("idle"); }}
+                  onChange={e => { setFichaNumero(e.target.value.replace(/\D/, "")); setFichaStatus("idle"); setComandaEncontrada(null); }}
                   onKeyDown={e => e.key === "Enter" && buscarFicha()}
                   className="h-12 text-lg font-bold flex-1"
                   inputMode="numeric"
@@ -491,9 +509,51 @@ function GarcomApp() {
             </div>
 
             {fichaStatus === "ocupada" && (
-              <Card className="p-4 border-destructive/50 bg-destructive/5">
-                <p className="font-semibold text-destructive">Ficha {fichaNumero} já está em uso</p>
-                <p className="text-sm text-muted-foreground mt-1">Use outro número ou consulte o caixa.</p>
+              <Card className={"p-4 " + (comandaEncontrada ? "border-primary/40 bg-primary/5" : "border-destructive/50 bg-destructive/5")}>
+                {comandaEncontrada ? (
+                  <>
+                    <div className="flex items-center gap-2 mb-3">
+                      <div className="h-2 w-2 rounded-full bg-primary" />
+                      <p className="font-semibold text-sm">Ficha {fichaNumero} encontrada</p>
+                    </div>
+                    <div className="space-y-1 mb-4">
+                      <p className="text-sm"><span className="text-muted-foreground">Cliente:</span> <span className="font-semibold">{comandaEncontrada.cliente_nome ?? "Avulso"}</span></p>
+                      <p className="text-sm"><span className="text-muted-foreground">Mesa:</span> <span className="font-semibold">{(comandaEncontrada as any).mesas?.numero ?? "—"}</span></p>
+                      <p className="text-sm"><span className="text-muted-foreground">Total atual:</span> <span className="font-bold text-primary">R$ {Number(comandaEncontrada.total).toFixed(2).replace(".", ",")}</span></p>
+                    </div>
+                    <Button className="w-full h-11 font-semibold" onClick={() => {
+                      // Encontra a mesa na lista e abre o modal direto no lançamento
+                      const mesa = mesas.find(m => m.id === comandaEncontrada.mesa_id);
+                      if (mesa) {
+                        setModal({ mesa, comanda: comandaEncontrada as Comanda, view: "lancar" });
+                        setFichaNumero("");
+                        setFichaStatus("idle");
+                        setComandaEncontrada(null);
+                      } else {
+                        // Mesa não carregada ainda — abre pelo modal inline
+                        getMesasComComandas().then(ms => {
+                          setMesas(ms);
+                          const m = ms.find(m => m.id === comandaEncontrada.mesa_id);
+                          if (m) {
+                            setModal({ mesa: m, comanda: comandaEncontrada as Comanda, view: "lancar" });
+                            setFichaNumero("");
+                            setFichaStatus("idle");
+                            setComandaEncontrada(null);
+                          } else {
+                            toast.error("Mesa não encontrada. Vá até a aba Mesas.");
+                          }
+                        });
+                      }
+                    }}>
+                      Lançar itens nesta comanda →
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-semibold text-destructive">Ficha {fichaNumero} já está em uso</p>
+                    <p className="text-sm text-muted-foreground mt-1">Use outro número ou consulte o caixa.</p>
+                  </>
+                )}
               </Card>
             )}
 
