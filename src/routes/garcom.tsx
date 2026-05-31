@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { ChamadaToast, ChamadaGarcomPainel } from "@/components/ChamadaGarcomAlert";
+import { SyncStatusBadge } from "@/components/SyncStatusBadge";
 import { useChamadasGarcom } from "@/hooks/use-chamadas-garcom";
 
 export const Route = createFileRoute("/garcom")({
@@ -348,7 +349,7 @@ function GarcomApp() {
       <div className="sticky top-0 z-10 bg-background border-b border-border px-4 py-3 flex items-center justify-between">
         <div>
           <p className="font-bold text-sm">{sessao.nome}</p>
-          <p className="text-xs text-muted-foreground">Garçom</p>
+          <SyncStatusBadge />
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => setPainelChamadas(true)} className="relative p-2">
