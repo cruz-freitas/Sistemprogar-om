@@ -85,6 +85,7 @@ function GarcomApp() {
 
   // ─── Chamadas garçom (painel) ─────────────────────────────────────────────
   const [painelChamadas, setPainelChamadas] = useState(false);
+  const [sincronizando, setSincronizando] = useState(false);
 
   // ─── Carregamento inicial ──────────────────────────────────────────────────
   const carregar = useCallback(async () => {
@@ -111,19 +112,26 @@ function GarcomApp() {
     carregar();
   }, []);
 
-  // ─── Realtime: atualiza mesas quando mudam ─────────────────────────────────
+  // ─── Realtime: atualiza mesas e produtos quando mudam ────────────────────────
   useEffect(() => {
     if (!sessao) return;
 
-    const channel = supabase
-      .channel("garcom-mesas")
-      .on("postgres_changes", { event: "*", schema: "public", table: "mesas" }, () => {
-        getMesasComComandas().then(setMesas).catch(() => {});
-      })
-      .on("postgres_changes", { event: "*", schema: "public", table: "comandas" }, () => {
-        getMesasComComandas().then(setMesas).catch(() => {});
-      })
-      .subscribe();
+    const channel = supabase.channel("garcom-realtime");
+
+    channel.on("postgres_changes", { event: "*", schema: "public", table: "mesas" }, () => {
+      getMesasComComandas().then(setMesas).catch(() => {});
+    });
+    channel.on("postgres_changes", { event: "*", schema: "public", table: "comandas" }, () => {
+      getMesasComComandas().then(setMesas).catch(() => {});
+    });
+    channel.on("postgres_changes", { event: "*", schema: "public", table: "produtos" }, () => {
+      getProdutos().then(setProdutos).catch(() => {});
+    });
+    channel.on("postgres_changes", { event: "*", schema: "public", table: "categorias" }, () => {
+      getCategorias().then(setCategorias).catch(() => {});
+    });
+
+    channel.subscribe();
 
     return () => { channel.unsubscribe(); };
   }, [sessao]);
@@ -344,8 +352,12 @@ function GarcomApp() {
           <button onClick={() => setPainelChamadas(true)} className="relative p-2">
             <Bell className="h-5 w-5" />
           </button>
-          <button onClick={carregar} className="p-2 text-muted-foreground">
-            <RefreshCw className="h-4 w-4" />
+          <button
+            onClick={async () => { setSincronizando(true); await carregar(); setSincronizando(false); toast.success("Cardápio atualizado!"); }}
+            className="p-2 text-muted-foreground"
+            title="Sincronizar cardápio"
+          >
+            <RefreshCw className={"h-4 w-4 transition-transform " + (sincronizando ? "animate-spin" : "")} />
           </button>
           <button onClick={sair} className="p-2 text-muted-foreground">
             <LogOut className="h-4 w-4" />
