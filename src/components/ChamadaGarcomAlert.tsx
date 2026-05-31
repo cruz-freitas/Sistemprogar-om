@@ -10,7 +10,7 @@
  */
 
 import { Bell, BellRing, Check, CheckCheck, X, Clock, History } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useChamadasGarcom, type ChamadaPendente, type ChamadaHistorico } from "@/hooks/use-chamadas-garcom";
 
 function tempoEspera(iso: string) {
@@ -54,30 +54,56 @@ export function ChamadaBadge({ onClick }: { onClick?: () => void }) {
   );
 }
 
-// ─── Toast compacto (máx 3 chamadas mais antigas) ─────────────────────────────
+// ─── Toast com countdown de 20s ──────────────────────────────────────────────
 export function ChamadaToast() {
   const { novasChamadas, atender } = useChamadasGarcom();
-  if (novasChamadas.length === 0) return null;
+  const [visivel, setVisivel] = useState(true);
+  const [countdown, setCountdown] = useState(20);
+  const idAtual = novasChamadas[novasChamadas.length - 1]?.id;
 
-  // Mostra só a mais recente no toast
+  // Reseta quando muda a chamada exibida
+  useEffect(() => {
+    if (novasChamadas.length === 0) return;
+    setVisivel(true);
+    setCountdown(20);
+  }, [idAtual]);
+
+  // Countdown de 20s
+  useEffect(() => {
+    if (novasChamadas.length === 0 || !visivel) return;
+    if (countdown <= 0) { setVisivel(false); return; }
+    const t = setTimeout(() => setCountdown(c => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [countdown, visivel, novasChamadas.length]);
+
+  if (novasChamadas.length === 0 || !visivel) return null;
+
   const c = novasChamadas[novasChamadas.length - 1];
   const extras = novasChamadas.length - 1;
+  const pct = (countdown / 20) * 100;
 
   return (
-    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] w-[calc(100vw-2rem)] max-w-sm space-y-2">
-      <div className="bg-amber-500 text-white rounded-2xl shadow-2xl p-4 flex items-center gap-3">
-        <div className="h-12 w-12 rounded-full bg-white/20 flex items-center justify-center shrink-0 font-black text-2xl">
-          {c.mesa_numero}
+    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] w-[calc(100vw-2rem)] max-w-sm">
+      <div className="bg-amber-500 text-white rounded-2xl shadow-2xl overflow-hidden">
+        {/* Barra de progresso */}
+        <div className="h-1 bg-white/20">
+          <div className="h-full bg-white/60 transition-all duration-1000 ease-linear" style={{ width: pct + "%" }} />
         </div>
-        <div className="flex-1 min-w-0">
-          <p className="font-bold text-lg leading-none">Mesa {c.mesa_numero} chamando!</p>
-          {c.cliente_nome && <p className="text-sm text-white/80 truncate">{c.cliente_nome}</p>}
-          {extras > 0 && <p className="text-xs text-white/70 mt-0.5">+{extras} outra{extras > 1 ? "s" : ""} aguardando</p>}
+        <div className="p-4 flex items-center gap-3">
+          <div className="h-12 w-12 rounded-full bg-white/20 flex items-center justify-center shrink-0 font-black text-2xl">
+            {c.mesa_numero}
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="font-bold text-lg leading-none">Mesa {c.mesa_numero} chamando!</p>
+            {c.cliente_nome && <p className="text-sm text-white/80 truncate">{c.cliente_nome}</p>}
+            {extras > 0 && <p className="text-xs text-white/70 mt-0.5">+{extras} outra{extras > 1 ? "s" : ""} aguardando</p>}
+            <p className="text-xs text-white/60 mt-0.5">Fecha em {countdown}s · continua nos alertas</p>
+          </div>
+          <button onClick={() => atender(c.id)}
+            className="shrink-0 bg-white text-amber-600 rounded-xl px-3 py-2 font-bold text-sm">
+            OK
+          </button>
         </div>
-        <button onClick={() => atender(c.id)}
-          className="shrink-0 bg-white text-amber-600 rounded-xl px-3 py-2 font-bold text-sm">
-          OK
-        </button>
       </div>
     </div>
   );
