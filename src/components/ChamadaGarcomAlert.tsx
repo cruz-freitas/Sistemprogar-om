@@ -1,11 +1,43 @@
 /**
  * ChamadaGarcomAlert.tsx
- * Painel de chamadas de garçom — aparece no app do garçom e no painel ADM.
+ * 
+ * Estratégia para volume alto (40+ mesas):
+ * - Toast compacto mostra apenas as 3 mais antigas (quem espera mais é prioridade)
+ * - Painel completo com abas: Pendentes | Histórico do dia
+ * - Botão "Atender todas" para limpar rápido
+ * - Agrupamento visual por urgência (tempo de espera)
+ * - Histórico do dia com horário de atendimento
  */
 
-import { Bell, BellRing, Check, CheckCheck, X, Clock } from "lucide-react";
+import { Bell, BellRing, Check, CheckCheck, X, Clock, History } from "lucide-react";
 import { useState } from "react";
-import { useChamadasGarcom, type ChamadaPendente } from "@/hooks/use-chamadas-garcom";
+import { useChamadasGarcom, type ChamadaPendente, type ChamadaHistorico } from "@/hooks/use-chamadas-garcom";
+
+function tempoEspera(iso: string) {
+  const min = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (min < 1) return "agora";
+  if (min < 60) return `${min}min`;
+  return `${Math.floor(min / 60)}h${min % 60 > 0 ? ` ${min % 60}min` : ""}`;
+}
+
+function urgencia(iso: string): "alta" | "media" | "normal" {
+  const min = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (min >= 5) return "alta";
+  if (min >= 2) return "media";
+  return "normal";
+}
+
+const COR_URGENCIA = {
+  alta:   "border-destructive/60 bg-destructive/10",
+  media:  "border-amber-500/60 bg-amber-500/10",
+  normal: "border-border bg-card",
+};
+
+const COR_NUMERO = {
+  alta:   "bg-destructive text-white",
+  media:  "bg-amber-500 text-white",
+  normal: "bg-accent text-foreground",
+};
 
 // ─── Badge no header ──────────────────────────────────────────────────────────
 export function ChamadaBadge({ onClick }: { onClick?: () => void }) {
@@ -13,42 +45,37 @@ export function ChamadaBadge({ onClick }: { onClick?: () => void }) {
   if (totalPendentes === 0) return null;
   const animando = novasChamadas.length > 0;
   return (
-    <button
-      onClick={onClick}
-      className={
-        "relative flex items-center gap-1.5 rounded-full px-2.5 py-1 text-sm font-semibold transition " +
-        (animando
-          ? "bg-amber-500 text-white animate-pulse shadow-lg shadow-amber-500/40"
-          : "bg-amber-500/20 text-amber-400 border border-amber-500/40 hover:bg-amber-500/30")
-      }
-    >
+    <button onClick={onClick}
+      className={"relative flex items-center gap-1.5 rounded-full px-2.5 py-1 text-sm font-semibold transition " +
+        (animando ? "bg-amber-500 text-white animate-pulse shadow-lg" : "bg-amber-500/20 text-amber-400 border border-amber-500/40")}>
       {animando ? <BellRing className="h-4 w-4 animate-bounce" /> : <Bell className="h-4 w-4" />}
       {totalPendentes}
     </button>
   );
 }
 
-// ─── Toast flutuante para o garçom ────────────────────────────────────────────
+// ─── Toast compacto (máx 3 chamadas mais antigas) ─────────────────────────────
 export function ChamadaToast() {
   const { novasChamadas, atender } = useChamadasGarcom();
   if (novasChamadas.length === 0) return null;
 
-  const c = novasChamadas[0];
+  // Mostra só a mais recente no toast
+  const c = novasChamadas[novasChamadas.length - 1];
+  const extras = novasChamadas.length - 1;
+
   return (
-    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] w-[calc(100vw-2rem)] max-w-sm">
-      <div className="bg-amber-500 text-white rounded-2xl shadow-2xl p-4 flex items-center gap-3 animate-bounce">
-        <div className="h-12 w-12 rounded-full bg-white/20 flex items-center justify-center shrink-0">
-          <span className="text-2xl font-black">{c.mesa_numero}</span>
+    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] w-[calc(100vw-2rem)] max-w-sm space-y-2">
+      <div className="bg-amber-500 text-white rounded-2xl shadow-2xl p-4 flex items-center gap-3">
+        <div className="h-12 w-12 rounded-full bg-white/20 flex items-center justify-center shrink-0 font-black text-2xl">
+          {c.mesa_numero}
         </div>
         <div className="flex-1 min-w-0">
           <p className="font-bold text-lg leading-none">Mesa {c.mesa_numero} chamando!</p>
           {c.cliente_nome && <p className="text-sm text-white/80 truncate">{c.cliente_nome}</p>}
-          {c.codigo_comanda && <p className="text-xs text-white/70 font-mono">#{c.codigo_comanda}</p>}
+          {extras > 0 && <p className="text-xs text-white/70 mt-0.5">+{extras} outra{extras > 1 ? "s" : ""} aguardando</p>}
         </div>
-        <button
-          onClick={() => atender(c.id)}
-          className="shrink-0 bg-white text-amber-600 rounded-xl px-3 py-2 font-bold text-sm"
-        >
+        <button onClick={() => atender(c.id)}
+          className="shrink-0 bg-white text-amber-600 rounded-xl px-3 py-2 font-bold text-sm">
           OK
         </button>
       </div>
@@ -56,57 +83,49 @@ export function ChamadaToast() {
   );
 }
 
-// ─── Painel completo de chamadas (ADM + garçom) ───────────────────────────────
+// ─── Painel completo ──────────────────────────────────────────────────────────
 export function ChamadaGarcomPainel({ modo = "flutuante" }: { modo?: "flutuante" | "inline" }) {
-  const { chamadas, novasChamadas, totalPendentes, atender, atenderTodas, pedirPermissao } = useChamadasGarcom();
+  const { chamadas, novasChamadas, historico, totalPendentes, atender, atenderTodas, pedirPermissao } = useChamadasGarcom();
   const [aberto, setAberto] = useState(false);
+  const [aba, setAba] = useState<"pendentes" | "historico">("pendentes");
 
-  if (modo === "inline") {
-    return <PainelInline chamadas={chamadas} novasChamadas={novasChamadas} atender={atender} atenderTodas={atenderTodas} pedirPermissao={pedirPermissao} />;
-  }
+  const conteudo = (
+    <PainelConteudo
+      chamadas={chamadas}
+      novasChamadas={novasChamadas}
+      historico={historico}
+      aba={aba}
+      setAba={setAba}
+      atender={atender}
+      atenderTodas={atenderTodas}
+      pedirPermissao={pedirPermissao}
+    />
+  );
+
+  if (modo === "inline") return conteudo;
 
   return (
     <>
-      {/* Botão flutuante */}
       {totalPendentes > 0 && (
-        <button
-          onClick={() => setAberto(true)}
-          className={
-            "fixed bottom-24 right-4 z-50 flex items-center gap-2 rounded-full px-4 py-3 font-bold shadow-2xl transition " +
-            (novasChamadas.length > 0
-              ? "bg-amber-500 text-white animate-bounce"
-              : "bg-amber-500 text-white")
-          }
-        >
+        <button onClick={() => setAberto(true)}
+          className={"fixed bottom-24 right-4 z-50 flex items-center gap-2 rounded-full px-4 py-3 font-bold shadow-2xl bg-amber-500 text-white " +
+            (novasChamadas.length > 0 ? "animate-bounce" : "")}>
           <BellRing className="h-5 w-5" />
-          <span>{totalPendentes} mesa{totalPendentes > 1 ? "s" : ""}</span>
+          <span>{totalPendentes}</span>
         </button>
       )}
 
-      {/* Modal */}
       {aberto && (
         <div className="fixed inset-0 bg-black/60 z-[100] flex items-end" onClick={() => setAberto(false)}>
-          <div className="w-full bg-background rounded-t-2xl max-h-[70vh] flex flex-col" onClick={e => e.stopPropagation()}>
+          <div className="w-full bg-background rounded-t-2xl max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="flex justify-center pt-3"><div className="h-1 w-12 rounded-full bg-muted" /></div>
             <div className="flex items-center justify-between px-4 py-3 border-b">
-              <div className="flex items-center gap-2">
-                <Bell className="h-5 w-5 text-amber-500" />
-                <p className="font-bold">Chamadas ({totalPendentes})</p>
-              </div>
-              <div className="flex items-center gap-2">
-                {totalPendentes > 1 && (
-                  <button onClick={atenderTodas} className="text-xs bg-amber-500 text-white rounded-lg px-3 py-1.5 font-semibold flex items-center gap-1">
-                    <CheckCheck className="h-3.5 w-3.5" /> Atender todas
-                  </button>
-                )}
-                <button onClick={() => setAberto(false)} className="p-1.5 text-muted-foreground">
-                  <X className="h-5 w-5" />
-                </button>
-              </div>
+              <p className="font-bold flex items-center gap-2">
+                <Bell className="h-4 w-4 text-amber-500" /> Chamadas
+              </p>
+              <button onClick={() => setAberto(false)}><X className="h-5 w-5" /></button>
             </div>
-            <div className="overflow-y-auto flex-1">
-              <PainelInline chamadas={chamadas} novasChamadas={novasChamadas} atender={atender} atenderTodas={atenderTodas} pedirPermissao={pedirPermissao} />
-            </div>
+            <div className="flex-1 overflow-y-auto">{conteudo}</div>
           </div>
         </div>
       )}
@@ -114,50 +133,162 @@ export function ChamadaGarcomPainel({ modo = "flutuante" }: { modo?: "flutuante"
   );
 }
 
-function PainelInline({ chamadas, novasChamadas, atender, atenderTodas, pedirPermissao }: {
+function PainelConteudo({ chamadas, novasChamadas, historico, aba, setAba, atender, atenderTodas, pedirPermissao }: {
   chamadas: ChamadaPendente[];
   novasChamadas: ChamadaPendente[];
+  historico: ChamadaHistorico[];
+  aba: "pendentes" | "historico";
+  setAba: (a: "pendentes" | "historico") => void;
   atender: (id: string) => void;
   atenderTodas: () => void;
   pedirPermissao: () => void;
 }) {
-  if (chamadas.length === 0) {
-    return (
-      <div className="p-8 text-center text-muted-foreground">
-        <Bell className="h-8 w-8 mx-auto mb-2 opacity-30" />
-        <p className="text-sm">Nenhuma chamada pendente</p>
-      </div>
-    );
-  }
+  // Ordena pendentes: mais antigas primeiro (maior urgência)
+  const pendentesOrdenadas = [...chamadas].sort(
+    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  );
+
+  const atendidas = historico.filter(c => c.status !== "pendente");
+  const totalHoje = historico.length;
 
   return (
-    <div className="divide-y divide-border">
-      {chamadas.map(c => {
-        const isNova = novasChamadas.some(n => n.id === c.id);
-        const minutos = Math.floor((Date.now() - new Date(c.created_at).getTime()) / 60000);
-        return (
-          <div key={c.id} className={"flex items-center gap-3 px-4 py-3 " + (isNova ? "bg-amber-500/10" : "")}>
-            <div className={"h-12 w-12 rounded-full flex items-center justify-center shrink-0 font-black text-xl " + (isNova ? "bg-amber-500 text-white" : "bg-accent text-foreground")}>
-              {c.mesa_numero}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="font-semibold">Mesa {c.mesa_numero}</p>
-              {c.cliente_nome && <p className="text-sm text-muted-foreground truncate">{c.cliente_nome}</p>}
-              {c.codigo_comanda && <p className="text-xs text-muted-foreground font-mono">#{c.codigo_comanda}</p>}
-              <p className="text-xs text-muted-foreground flex items-center gap-1 mt-0.5">
-                <Clock className="h-3 w-3" />
-                {minutos === 0 ? "Agora" : `${minutos}min atrás`}
+    <div>
+      {/* Abas */}
+      <div className="flex border-b border-border">
+        <button onClick={() => setAba("pendentes")}
+          className={"flex-1 py-3 text-sm font-semibold border-b-2 transition " +
+            (aba === "pendentes" ? "border-primary text-primary" : "border-transparent text-muted-foreground")}>
+          Pendentes {chamadas.length > 0 && <span className="ml-1 bg-amber-500 text-white text-xs rounded-full px-1.5">{chamadas.length}</span>}
+        </button>
+        <button onClick={() => setAba("historico")}
+          className={"flex-1 py-3 text-sm font-semibold border-b-2 transition flex items-center justify-center gap-1 " +
+            (aba === "historico" ? "border-primary text-primary" : "border-transparent text-muted-foreground")}>
+          <History className="h-3.5 w-3.5" /> Hoje ({totalHoje})
+        </button>
+      </div>
+
+      {/* ABA PENDENTES */}
+      {aba === "pendentes" && (
+        <div>
+          {/* Ações em massa */}
+          {chamadas.length > 1 && (
+            <div className="px-4 py-3 border-b border-border bg-amber-500/5 flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                {chamadas.length} mesas aguardando · ordenadas por tempo
               </p>
+              <button onClick={atenderTodas}
+                className="flex items-center gap-1.5 bg-primary text-primary-foreground rounded-lg px-3 py-1.5 text-xs font-bold">
+                <CheckCheck className="h-3.5 w-3.5" /> Atender todas
+              </button>
             </div>
-            <button
-              onClick={() => atender(c.id)}
-              className="shrink-0 bg-primary text-primary-foreground rounded-xl px-4 py-2 font-semibold text-sm flex items-center gap-1.5"
-            >
-              <Check className="h-4 w-4" /> Atendido
-            </button>
-          </div>
-        );
-      })}
+          )}
+
+          {chamadas.length === 0 ? (
+            <div className="p-10 text-center text-muted-foreground">
+              <Bell className="h-10 w-10 mx-auto mb-2 opacity-20" />
+              <p className="text-sm">Nenhuma chamada pendente</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-border">
+              {pendentesOrdenadas.map(c => {
+                const urg = urgencia(c.created_at);
+                const isNova = novasChamadas.some(n => n.id === c.id);
+                return (
+                  <div key={c.id} className={"flex items-center gap-3 px-4 py-3 border-l-4 " + COR_URGENCIA[urg] + (urg === "alta" ? " border-l-destructive" : urg === "media" ? " border-l-amber-500" : " border-l-transparent")}>
+                    <div className={"h-12 w-12 rounded-full flex items-center justify-center shrink-0 font-black text-xl " + COR_NUMERO[urg]}>
+                      {c.mesa_numero}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="font-semibold">Mesa {c.mesa_numero}</p>
+                        {isNova && <span className="text-[9px] bg-amber-500 text-white rounded-full px-1.5 py-0.5 font-bold">NOVA</span>}
+                        {urg === "alta" && <span className="text-[9px] bg-destructive text-white rounded-full px-1.5 py-0.5 font-bold">URGENTE</span>}
+                      </div>
+                      {c.cliente_nome && <p className="text-sm text-muted-foreground truncate">{c.cliente_nome}</p>}
+                      {c.codigo_comanda && <p className="text-xs text-muted-foreground font-mono">#{c.codigo_comanda}</p>}
+                      <p className={"text-xs flex items-center gap-1 mt-0.5 font-medium " + (urg === "alta" ? "text-destructive" : urg === "media" ? "text-amber-500" : "text-muted-foreground")}>
+                        <Clock className="h-3 w-3" /> {tempoEspera(c.created_at)}
+                      </p>
+                    </div>
+                    <button onClick={() => atender(c.id)}
+                      className="shrink-0 bg-primary text-primary-foreground rounded-xl px-4 py-2.5 font-bold text-sm flex items-center gap-1.5 active:scale-95 transition">
+                      <Check className="h-4 w-4" /> Atendido
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Notificações */}
+          {"Notification" in window && Notification.permission !== "granted" && (
+            <div className="p-3 border-t border-border">
+              <button onClick={pedirPermissao}
+                className="w-full text-xs text-center text-muted-foreground border border-dashed border-border rounded-xl py-2.5 hover:border-primary hover:text-primary transition">
+                🔔 Ativar notificações para alertas sonoros
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ABA HISTÓRICO */}
+      {aba === "historico" && (
+        <div>
+          {historico.length === 0 ? (
+            <div className="p-10 text-center text-muted-foreground">
+              <History className="h-10 w-10 mx-auto mb-2 opacity-20" />
+              <p className="text-sm">Nenhuma chamada hoje</p>
+            </div>
+          ) : (
+            <>
+              {/* Resumo do dia */}
+              <div className="px-4 py-3 border-b border-border bg-accent/30 flex items-center gap-4 text-sm">
+                <div className="text-center">
+                  <p className="font-bold text-lg">{totalHoje}</p>
+                  <p className="text-xs text-muted-foreground">total</p>
+                </div>
+                <div className="text-center">
+                  <p className="font-bold text-lg text-success">{atendidas.length}</p>
+                  <p className="text-xs text-muted-foreground">atendidas</p>
+                </div>
+                <div className="text-center">
+                  <p className="font-bold text-lg text-amber-500">{chamadas.length}</p>
+                  <p className="text-xs text-muted-foreground">pendentes</p>
+                </div>
+              </div>
+
+              <div className="divide-y divide-border">
+                {historico.map(c => (
+                  <div key={c.id} className={"flex items-center gap-3 px-4 py-3 " + (c.status === "pendente" ? "bg-amber-500/5" : "")}>
+                    <div className={"h-10 w-10 rounded-full flex items-center justify-center shrink-0 font-bold " +
+                      (c.status === "pendente" ? "bg-amber-500 text-white" : "bg-accent text-muted-foreground")}>
+                      {c.mesa_numero}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-sm">Mesa {c.mesa_numero}</p>
+                      {c.cliente_nome && <p className="text-xs text-muted-foreground truncate">{c.cliente_nome}</p>}
+                      <p className="text-xs text-muted-foreground flex items-center gap-1">
+                        <Clock className="h-3 w-3" />
+                        {new Date(c.created_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
+                        {c.atendida_em && (
+                          <span className="ml-1 text-success">
+                            → atendida às {new Date(c.atendida_em).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                    <span className={"text-xs font-semibold px-2 py-1 rounded-full " +
+                      (c.status === "pendente" ? "bg-amber-500/20 text-amber-500" : "bg-success/20 text-success")}>
+                      {c.status === "pendente" ? "pendente" : "atendida"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
