@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { ChamadaToast, ChamadaGarcomPainel } from "@/components/ChamadaGarcomAlert";
+import { useChamadasGarcom } from "@/hooks/use-chamadas-garcom";
 
 export const Route = createFileRoute("/garcom")({
   component: GarcomApp,
@@ -46,6 +47,7 @@ type MesaComCmds = Mesa & { comandas: Comanda[] };
 function GarcomApp() {
   const navigate = useNavigate();
   const sessao = carregarSessao();
+  const { totalPendentes, novasChamadas } = useChamadasGarcom();
 
   // ─── State principal ─────────────────────────────────────────────────────
   const [aba, setAba] = useState<Aba>("comanda");
@@ -350,7 +352,12 @@ function GarcomApp() {
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => setPainelChamadas(true)} className="relative p-2">
-            <Bell className="h-5 w-5" />
+            <Bell className={"h-5 w-5 " + (novasChamadas.length > 0 ? "text-amber-500" : "")} />
+            {totalPendentes > 0 && (
+              <span className={"absolute top-1 right-1 h-4 w-4 rounded-full text-[9px] font-bold flex items-center justify-center " + (novasChamadas.length > 0 ? "bg-amber-500 text-white animate-pulse" : "bg-amber-500/80 text-white")}>
+                {totalPendentes > 9 ? "9+" : totalPendentes}
+              </span>
+            )}
           </button>
           <button
             onClick={async () => { setSincronizando(true); await carregar(); setSincronizando(false); toast.success("Cardápio atualizado!"); }}
@@ -365,13 +372,13 @@ function GarcomApp() {
         </div>
       </div>
 
-      {/* Painel de chamadas */}
+      {/* Painel de chamadas com histórico */}
       {painelChamadas && (
         <div className="fixed inset-0 bg-black/60 z-[100] flex items-end" onClick={() => setPainelChamadas(false)}>
-          <div className="w-full bg-background rounded-t-2xl max-h-[70vh] flex flex-col" onClick={e => e.stopPropagation()}>
+          <div className="w-full bg-background rounded-t-2xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="flex justify-center pt-3"><div className="h-1 w-12 rounded-full bg-muted" /></div>
             <div className="flex items-center justify-between px-4 py-3 border-b">
-              <p className="font-bold flex items-center gap-2"><Bell className="h-4 w-4 text-amber-500" /> Chamadas pendentes</p>
+              <p className="font-bold flex items-center gap-2"><Bell className="h-4 w-4 text-amber-500" /> Chamadas de garçom</p>
               <button onClick={() => setPainelChamadas(false)}><X className="h-5 w-5" /></button>
             </div>
             <div className="flex-1 overflow-y-auto">
