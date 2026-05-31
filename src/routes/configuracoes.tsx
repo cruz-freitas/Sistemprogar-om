@@ -5,95 +5,192 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useEffect, useState } from "react";
-import { supabase, type Configuracao } from "@/lib/supabase";
+import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
+import { Save, RefreshCw } from "lucide-react";
 
 export const Route = createFileRoute("/configuracoes")({
   component: Configuracoes,
 });
 
+const FORM_PADRAO = {
+  nome_estabelecimento: "Bambui Bar",
+  cnpj: "",
+  endereco: "",
+  taxa_servico_pct: "10",
+  tempo_limite_min: "180",
+};
+
 function Configuracoes() {
-  const [config, setConfig] = useState<Configuracao | null>(null);
-  const [form, setForm] = useState({ nome_estabelecimento: "", cnpj: "", endereco: "", taxa_servico_pct: "10", tempo_limite_min: "180" });
+  const [configId, setConfigId] = useState<string | null>(null);
+  const [form, setForm] = useState(FORM_PADRAO);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    async function load() {
-      const { data } = await supabase.from("configuracoes").select("*").limit(1).single();
-      if (data) {
-        setConfig(data);
-        setForm({
-          nome_estabelecimento: data.nome_estabelecimento,
-          cnpj: data.cnpj ?? "",
-          endereco: data.endereco ?? "",
-          taxa_servico_pct: String(data.taxa_servico_pct),
-          tempo_limite_min: String(data.tempo_limite_min),
-        });
-      }
+  async function load() {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from("configuracoes")
+      .select("*")
+      .limit(1);
+
+    if (error) {
+      toast.error("Erro ao carregar configurações: " + error.message);
       setLoading(false);
+      return;
     }
-    load();
-  }, []);
+
+    const cfg = data?.[0];
+    if (cfg) {
+      setConfigId(cfg.id);
+      setForm({
+        nome_estabelecimento: cfg.nome_estabelecimento ?? "Bambui Bar",
+        cnpj: cfg.cnpj ?? "",
+        endereco: cfg.endereco ?? "",
+        taxa_servico_pct: String(cfg.taxa_servico_pct ?? 10),
+        tempo_limite_min: String(cfg.tempo_limite_min ?? 180),
+      });
+    } else {
+      // Nenhum registro — cria um automaticamente
+      await criar();
+    }
+    setLoading(false);
+  }
+
+  async function criar() {
+    const { data } = await supabase
+      .from("configuracoes")
+      .insert({
+        nome_estabelecimento: "Bambui Bar",
+        taxa_servico_pct: 10,
+        tempo_limite_min: 180,
+        impressao_automatica: true,
+      })
+      .select()
+      .single();
+    if (data) setConfigId(data.id);
+  }
+
+  useEffect(() => { load(); }, []);
 
   async function salvar() {
+    if (!form.nome_estabelecimento.trim()) {
+      toast.error("Nome do estabelecimento é obrigatório");
+      return;
+    }
     setSaving(true);
+
     const payload = {
-      nome_estabelecimento: form.nome_estabelecimento,
-      cnpj: form.cnpj || null,
-      endereco: form.endereco || null,
-      taxa_servico_pct: parseFloat(form.taxa_servico_pct),
-      tempo_limite_min: parseInt(form.tempo_limite_min),
+      nome_estabelecimento: form.nome_estabelecimento.trim(),
+      cnpj: form.cnpj.trim() || null,
+      endereco: form.endereco.trim() || null,
+      taxa_servico_pct: parseFloat(form.taxa_servico_pct) || 10,
+      tempo_limite_min: parseInt(form.tempo_limite_min) || 180,
       updated_at: new Date().toISOString(),
     };
-    const { error } = config
-      ? await supabase.from("configuracoes").update(payload).eq("id", config.id)
-      : await supabase.from("configuracoes").insert(payload);
-    if (error) toast.error("Erro ao salvar"); else toast.success("Configurações salvas!");
+
+    let error;
+
+    if (configId) {
+      ({ error } = await supabase
+        .from("configuracoes")
+        .update(payload)
+        .eq("id", configId));
+    } else {
+      const res = await supabase
+        .from("configuracoes")
+        .insert(payload)
+        .select()
+        .single();
+      error = res.error;
+      if (res.data) setConfigId(res.data.id);
+    }
+
+    if (error) {
+      toast.error("Erro ao salvar: " + error.message);
+    } else {
+      toast.success("Configurações salvas!");
+    }
     setSaving(false);
   }
 
+  function campo(label: string, key: keyof typeof form, tipo: string = "text", placeholder?: string) {
+    return (
+      <div>
+        <Label className="mb-1 block">{label}</Label>
+        <Input
+          type={tipo}
+          placeholder={placeholder}
+          value={form[key]}
+          onChange={e => setForm(prev => ({ ...prev, [key]: e.target.value }))}
+        />
+      </div>
+    );
+  }
+
   return (
-    <>
-      <PageHeader title="Configurações" description="Ajustes gerais do sistema" />
+    <div className="p-4 space-y-4">
+      <PageHeader
+        title="Configurações"
+        subtitle="Ajustes gerais do sistema"
+        actions={
+          <Button variant="outline" size="sm" onClick={load} disabled={loading}>
+            <RefreshCw className={"h-4 w-4 mr-1 " + (loading ? "animate-spin" : "")} />
+            Recarregar
+          </Button>
+        }
+      />
 
       {loading ? (
         <div className="grid lg:grid-cols-2 gap-4">
-          {[...Array(2)].map((_, i) => <Card key={i} className="p-5 h-48 animate-pulse bg-accent/30" />)}
+          {[...Array(2)].map((_, i) => (
+            <Card key={i} className="p-5 h-52 animate-pulse bg-accent/30" />
+          ))}
         </div>
       ) : (
         <div className="grid lg:grid-cols-2 gap-4">
+
           <Card className="p-5">
             <h3 className="font-semibold mb-4">Estabelecimento</h3>
             <div className="space-y-3">
-              <div><Label>Nome</Label><Input value={form.nome_estabelecimento} onChange={(e) => setForm({ ...form, nome_estabelecimento: e.target.value })} /></div>
-              <div><Label>CNPJ</Label><Input value={form.cnpj} onChange={(e) => setForm({ ...form, cnpj: e.target.value })} /></div>
-              <div><Label>Endereço</Label><Input value={form.endereco} onChange={(e) => setForm({ ...form, endereco: e.target.value })} /></div>
+              {campo("Nome do estabelecimento", "nome_estabelecimento", "text", "Ex: Bambui Bar")}
+              {campo("CNPJ", "cnpj", "text", "00.000.000/0000-00")}
+              {campo("Endereço", "endereco", "text", "Rua, número, bairro")}
             </div>
           </Card>
 
           <Card className="p-5">
             <h3 className="font-semibold mb-4">Operação</h3>
             <div className="space-y-3">
-              <div><Label>Taxa de serviço (%)</Label><Input type="number" value={form.taxa_servico_pct} onChange={(e) => setForm({ ...form, taxa_servico_pct: e.target.value })} /></div>
-              <div><Label>Tempo limite por comanda (min)</Label><Input type="number" value={form.tempo_limite_min} onChange={(e) => setForm({ ...form, tempo_limite_min: e.target.value })} /></div>
+              {campo("Taxa de serviço (%)", "taxa_servico_pct", "number")}
+              {campo("Tempo limite por comanda (min)", "tempo_limite_min", "number")}
+              <div className="pt-2 text-xs text-muted-foreground bg-accent/30 rounded-lg p-3">
+                A taxa de serviço é aplicada automaticamente sobre o subtotal de cada comanda.
+              </div>
             </div>
           </Card>
 
           <Card className="p-5 lg:col-span-2">
-            <h3 className="font-semibold mb-2">Sobre o sistema</h3>
+            <h3 className="font-semibold mb-2">Sobre</h3>
             <p className="text-sm text-muted-foreground">
-              Pesqueiro Bambuí · Sistema de Gestão v1.0 · Banco de dados Supabase conectado.
+              Bambui Bar · Sistema de Gestão PDV · Banco de dados Supabase.
             </p>
+            {configId && (
+              <p className="text-xs text-muted-foreground/50 mt-1 font-mono">ID: {configId}</p>
+            )}
           </Card>
 
           <div className="lg:col-span-2 flex justify-end">
-            <Button className="font-semibold" onClick={salvar} disabled={saving}>
-              {saving ? "Salvando..." : "Salvar configurações"}
+            <Button className="font-semibold gap-2 h-11 px-6" onClick={salvar} disabled={saving}>
+              {saving ? (
+                <><RefreshCw className="h-4 w-4 animate-spin" /> Salvando...</>
+              ) : (
+                <><Save className="h-4 w-4" /> Salvar configurações</>
+              )}
             </Button>
           </div>
         </div>
       )}
-    </>
+    </div>
   );
 }
