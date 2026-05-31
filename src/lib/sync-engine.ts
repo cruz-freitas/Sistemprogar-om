@@ -73,7 +73,8 @@ export function getStatusSync(): StatusSync { return { ..._status }; }
 
 // ─── Processar fila ───────────────────────────────────────────────────────────
 
-const ERROS_PERMANENTES = ["23505","23503","42703","42P01","23502"];
+const ERROS_PERMANENTES = ["23505","42703","42P01","23502"];
+// NOTA: 23503 (foreign_key) NÃO é permanente — pode ser que a comanda ainda não chegou ao banco
 
 export async function processarFila(): Promise<{ sucesso: number; falha: number }> {
   if (_rodando || !navigator.onLine) return { sucesso: 0, falha: 0 };
@@ -133,12 +134,11 @@ async function executarOperacao(op: ItemFila) {
       delete payload.taxa_servico;
       delete payload.solicitou_fechamento;
 
-      // ── Guarda contra inserção duplicada ──────────────────────────────────
-      // Se o comanda_id ainda é um ID temporário, a comanda ainda não chegou
-      // no banco. O loop do while vai processar a comanda primeiro (prioridade 2
-      // antes de 3), então isso só acontece se houver bug. Mas defende mesmo assim.
+      // ── Se comanda_id ainda é temporário, a comanda não foi sincronizada ainda ──
+      // Isso significa que o sync da comanda falhou ou ainda não rodou.
+      // Lança erro TEMPORÁRIO para tentar de novo depois (não descarta).
       if (op.tabela === "comanda_itens" && isTempId(payload.comanda_id ?? "")) {
-        throw new Error("comanda_id ainda é temporário — aguardando sync da comanda");
+        throw new Error(`TEMP_DEP: comanda_id temporário ${payload.comanda_id} — sync da comanda pendente`);
       }
 
       const { data, error } = await supabase
