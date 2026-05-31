@@ -117,6 +117,15 @@ export async function processarFila(): Promise<{ sucesso: number; falha: number 
     const restantes = await contarPendentes();
     set({ sincronizando: false, ultimaSync: new Date(), pendentes: restantes, erros: falha });
     salvarHistoricoSync({ ts: new Date().toISOString(), sucesso, falha, pendentes: restantes });
+
+    // Notifica todos os componentes para recarregar dados
+    if (sucesso > 0) {
+      window.dispatchEvent(new CustomEvent("bb:sync-done", { detail: { sucesso, falha } }));
+      // Se fila zerou, faz rehydrate completo do banco
+      if (restantes === 0) {
+        setTimeout(() => rehydratar(), 500);
+      }
+    }
   }
 
   return { sucesso, falha };
