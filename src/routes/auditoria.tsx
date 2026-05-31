@@ -30,17 +30,10 @@ type MesaAtiva = {
       quantidade: number;
       preco_unit: number;
       total: number;
-      status: string;
       cancelado: boolean;
       created_at: string;
     }[];
   }[];
-};
-
-const STATUS_ITEM: Record<string, { label: string; variant: "default" | "secondary" | "outline" | "destructive" }> = {
-  pendente:   { label: "Aguardando", variant: "secondary" },
-  em_preparo: { label: "Em preparo", variant: "default" },
-  pronto:     { label: "Pronto",     variant: "outline" },
 };
 
 function Auditoria() {
@@ -53,34 +46,61 @@ function Auditoria() {
     chamadas,
     novasChamadas,
     totalPendentes,
-    atenderChamada,
+    atender,
     atenderTodas,
     permissao,
     pedirPermissao,
   } = useChamadasGarcom();
 
   function getFuncId() {
-    try { return JSON.parse(sessionStorage.getItem("funcionario") ?? "null")?.id ?? null; }
-    catch { return null; }
+    try {
+      const raw = localStorage.getItem("sp_session_v2") || sessionStorage.getItem("sp_session_v2");
+      return raw ? JSON.parse(raw)?.id ?? null : null;
+    } catch { return null; }
   }
 
   async function load() {
     setLoading(true);
-    const { data } = await supabase
+
+    // Busca mesas ocupadas
+    const { data: mesasData } = await supabase
       .from("mesas")
-      .select(`
-        id, numero, status,
-        comandas!inner(
-          id, codigo, cliente_nome, aberta_em, total, solicitou_fechamento,
-          funcionarios(nome),
-          comanda_itens(id, nome_produto, quantidade, preco_unit, total, status, cancelado, created_at)
-        )
-      `)
+      .select("id, numero, status")
       .neq("status", "livre")
-      .eq("comandas.status", "aberta")
       .order("numero");
 
-    if (data) setMesas(data as MesaAtiva[]);
+    if (!mesasData || mesasData.length === 0) {
+      setMesas([]);
+      setUltimaAtt(new Date());
+      setLoading(false);
+      return;
+    }
+
+    const mesaIds = mesasData.map(m => m.id);
+
+    // Busca comandas abertas dessas mesas
+    const { data: comandasData } = await supabase
+      .from("comandas")
+      .select(`
+        id, codigo, cliente_nome, aberta_em, total, solicitou_fechamento, mesa_id,
+        funcionarios(nome),
+        comanda_itens(id, nome_produto, quantidade, preco_unit, total, cancelado, created_at)
+      `)
+      .in("mesa_id", mesaIds)
+      .eq("status", "aberta");
+
+    // Monta estrutura
+    const cmdMap: Record<string, any[]> = {};
+    (comandasData ?? []).forEach((c: any) => {
+      if (!cmdMap[c.mesa_id]) cmdMap[c.mesa_id] = [];
+      cmdMap[c.mesa_id].push(c);
+    });
+
+    const resultado = mesasData
+      .filter(m => cmdMap[m.id]?.length > 0)
+      .map(m => ({ ...m, comandas: cmdMap[m.id] ?? [] }));
+
+    setMesas(resultado as MesaAtiva[]);
     setUltimaAtt(new Date());
     setLoading(false);
   }
@@ -110,7 +130,6 @@ function Auditoria() {
   const mesasNormais = mesas.filter(m => !m.comandas[0]?.solicitou_fechamento);
 
   const totalItens = mesas.flatMap(m => m.comandas).flatMap(c => c.comanda_itens).filter(i => !i.cancelado).length;
-  const itensPendentes = mesas.flatMap(m => m.comandas).flatMap(c => c.comanda_itens).filter(i => i.status === "pendente" && !i.cancelado).length;
 
   return (
     <>
@@ -162,7 +181,7 @@ function Auditoria() {
                     </p>
                   </div>
                   <button
-                    onClick={() => atenderChamada(c.id, getFuncId())}
+                    onClick={() => atender(c.id, getFuncId())}
                     className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg px-3 py-2 text-xs font-semibold active:scale-95 transition"
                   >
                     <CheckCheck className="h-4 w-4" />
@@ -174,7 +193,7 @@ function Auditoria() {
           </div>
 
           {/* Botão de permissão se ainda não concedida */}
-          {permissao !== "granted" && (
+          {("Notification" in window && Notification.permission !== "granted") && (
             <button
               onClick={pedirPermissao}
               className="w-full text-xs text-center text-muted-foreground border border-dashed border-border rounded-xl py-2 hover:border-primary hover:text-primary transition"
@@ -195,11 +214,7 @@ function Auditoria() {
           <p className="text-2xl font-bold">{totalItens}</p>
           <p className="text-xs text-muted-foreground">Itens</p>
         </Card>
-        <Card className="p-3 text-center">
-          <p className="text-2xl font-bold text-warning">{itensPendentes}</p>
-          <p className="text-xs text-muted-foreground">Aguardando</p>
-        </Card>
-        <Card className={"p-3 text-center " + (mesasFechamento.length > 0 ? "border-destructive bg-destructive/10" : "")}>
+<Card className={"p-3 text-center " + (mesasFechamento.length > 0 ? "border-destructive bg-destructive/10" : "")}>
           <p className={"text-2xl font-bold " + (mesasFechamento.length > 0 ? "text-destructive" : "")}>{mesasFechamento.length}</p>
           <p className="text-xs text-muted-foreground">Fechamento</p>
         </Card>
@@ -252,9 +267,7 @@ function Auditoria() {
                         <span className="text-muted-foreground w-14 shrink-0">{formatHora(item.created_at)}</span>
                         <span className="flex-1 truncate">{item.quantidade}x {item.nome_produto}</span>
                         <span className="font-semibold shrink-0">R$ {Number(item.total).toFixed(2)}</span>
-                        <Badge variant={STATUS_ITEM[item.status]?.variant ?? "outline"} className="text-[9px] shrink-0">
-                          {STATUS_ITEM[item.status]?.label ?? item.status}
-                        </Badge>
+
                       </div>
                     ))}
                   </div>
@@ -316,9 +329,7 @@ function Auditoria() {
                         <span className="text-muted-foreground w-14 shrink-0">{formatHora(item.created_at)}</span>
                         <span className="flex-1 truncate">{item.quantidade}x {item.nome_produto}</span>
                         <span className="font-semibold shrink-0">R$ {Number(item.total).toFixed(2)}</span>
-                        <Badge variant={STATUS_ITEM[item.status]?.variant ?? "outline"} className="text-[9px] shrink-0">
-                          {STATUS_ITEM[item.status]?.label ?? item.status}
-                        </Badge>
+
                       </div>
                     ))}
                   </div>
