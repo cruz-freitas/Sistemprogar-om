@@ -1,50 +1,36 @@
 /**
- * sync-engine.ts
- * 
- * Motor de sincronização offline → Supabase.
- * 
- * - Processa a fila em ordem de prioridade quando online
- * - Substitui IDs temporários pelos IDs reais do banco
- * - Notifica todos os listeners sobre o status
- * - Recarrega dados frescos após sync bem-sucedido
+ * sync-engine.ts — Motor de sincronização offline → Supabase
+ *
+ * REGRAS FUNDAMENTAIS:
+ * 1. NUNCA apaga dado local antes de confirmar que chegou no banco
+ * 2. NUNCA sobrescreve dados locais com IDs temporários durante rehydrate
+ * 3. Processa a fila em ordem de prioridade (mesas → comandas → itens)
+ * 4. Ao resolver ID temporário → atualiza TODAS as referências na fila e no IndexedDB
  */
 
 import { supabase } from "./supabase";
 import {
-  getPendentes, removerDaFila, marcarErro, atualizarIdNaFila,
-  dbDelete, dbPut, dbPutMany, dbGetAll, STORES, contarPendentes,
-  salvarHistoricoSync, type OperacaoFila,
+  getPendentes, removerDaFila, marcarErro, substituirIdNaFila,
+  dbPut, dbPutMany, dbGetAll, dbDelete, STORES, contarPendentes,
+  salvarHistoricoSync, isTempId, type ItemFila,
 } from "./offline-queue";
 
 export type StatusSync = {
-  online: boolean;
-  pendentes: number;
+  online:        boolean;
+  pendentes:     number;
   sincronizando: boolean;
-  ultimaSync: Date | null;
-  erros: number;
+  ultimaSync:    Date | null;
+  erros:         number;
 };
 
 type Listener = (s: StatusSync) => void;
-
-let _status: StatusSync = {
-  online: navigator.onLine,
-  pendentes: 0,
-  sincronizando: false,
-  ultimaSync: null,
-  erros: 0,
-};
+let _status: StatusSync = { online: navigator.onLine, pendentes: 0, sincronizando: false, ultimaSync: null, erros: 0 };
 let _listeners: Listener[] = [];
-let _iniciado = false;
-let _processando = false;
+let _iniciado  = false;
+let _rodando   = false;
 
-function notificar() {
-  _listeners.forEach(fn => fn({ ..._status }));
-}
-
-function set(patch: Partial<StatusSync>) {
-  _status = { ..._status, ...patch };
-  notificar();
-}
+function notificar() { _listeners.forEach(fn => fn({ ..._status })); }
+function set(p: Partial<StatusSync>) { _status = { ..._status, ...p }; notificar(); }
 
 // ─── Inicialização ────────────────────────────────────────────────────────────
 
@@ -55,123 +41,104 @@ export function iniciarSync() {
   window.addEventListener("online", async () => {
     set({ online: true });
     await processarFila();
-    // Recarrega dados frescos
-    window.dispatchEvent(new CustomEvent("bb:rehydrate"));
+    // Só rehydrata DEPOIS que a fila estiver vazia
+    const p = await contarPendentes();
+    if (p === 0) await rehydratar();
   });
 
-  window.addEventListener("offline", () => {
-    set({ online: false });
-  });
+  window.addEventListener("offline", () => set({ online: false }));
 
-  set({ online: navigator.onLine });
-
-  // Atualiza contagem de pendentes a cada 3s
+  // Atualiza contador a cada 2s
   setInterval(async () => {
     const p = await contarPendentes();
     if (p !== _status.pendentes) set({ pendentes: p });
-  }, 3000);
+  }, 2000);
 
-  // Tenta processar ao iniciar se online
   if (navigator.onLine) {
-    setTimeout(() => processarFila(), 1500);
+    setTimeout(async () => {
+      await processarFila();
+      const p = await contarPendentes();
+      if (p === 0) await rehydratar();
+    }, 1500);
   }
 }
 
 export function onStatusSync(cb: Listener): () => void {
   _listeners.push(cb);
-  cb({ ..._status }); // estado atual imediatamente
+  cb({ ..._status });
   return () => { _listeners = _listeners.filter(l => l !== cb); };
 }
 
-export function getStatusSync(): StatusSync {
-  return { ..._status };
-}
+export function getStatusSync(): StatusSync { return { ..._status }; }
 
 // ─── Processar fila ───────────────────────────────────────────────────────────
 
-const ERROS_PERMANENTES = [
-  "23505", // unique_violation
-  "23503", // foreign_key_violation  
-  "42703", // undefined_column
-  "42P01", // undefined_table
-  "23502", // not_null_violation
-];
+const ERROS_PERMANENTES = ["23505","23503","42703","42P01","23502"];
 
 export async function processarFila(): Promise<{ sucesso: number; falha: number }> {
-  if (_processando || !navigator.onLine) return { sucesso: 0, falha: 0 };
-  _processando = true;
+  if (_rodando || !navigator.onLine) return { sucesso: 0, falha: 0 };
+  _rodando = true;
   set({ sincronizando: true });
 
-  const pendentes = await getPendentes();
-  if (pendentes.length === 0) {
-    _processando = false;
-    set({ sincronizando: false });
-    return { sucesso: 0, falha: 0 };
-  }
-
   let sucesso = 0;
-  let falha = 0;
+  let falha   = 0;
 
-  for (const op of pendentes) {
-    try {
-      await executarOperacao(op);
-      await removerDaFila(op.id!);
-      sucesso++;
-    } catch (err: any) {
-      const msg = String(err?.code ?? err?.message ?? err ?? "");
-      const permanente = ERROS_PERMANENTES.some(c => msg.includes(c));
+  try {
+    // Busca pendentes a cada iteração porque os IDs podem ter mudado
+    let pendentes = await getPendentes();
 
-      if (permanente) {
-        console.warn("[Sync] Erro permanente, descartando:", op.tabela, op.record_id, msg);
+    while (pendentes.length > 0) {
+      const op = pendentes[0];
+      try {
+        await executarOperacao(op);
         await removerDaFila(op.id!);
-      } else {
-        console.error("[Sync] Erro temporário:", op.tabela, op.record_id, msg);
-        await marcarErro(op.id!, msg);
-        falha++;
+        sucesso++;
+      } catch (err: any) {
+        const msg       = String(err?.code ?? err?.message ?? err ?? "");
+        const permanente = ERROS_PERMANENTES.some(c => msg.includes(c));
+
+        if (permanente) {
+          console.warn("[Sync] Descartando erro permanente:", op.tabela, op.record_id, msg);
+          await removerDaFila(op.id!);
+        } else {
+          console.error("[Sync] Erro temporário:", op.tabela, op.record_id, msg);
+          await marcarErro(op.id!, msg);
+          falha++;
+          // Para de processar se der erro de rede — tenta de novo depois
+          break;
+        }
       }
+      // Rebusca porque os IDs na fila podem ter sido atualizados
+      pendentes = await getPendentes();
     }
+  } finally {
+    _rodando = false;
+    const restantes = await contarPendentes();
+    set({ sincronizando: false, ultimaSync: new Date(), pendentes: restantes, erros: falha });
+    salvarHistoricoSync({ ts: new Date().toISOString(), sucesso, falha, pendentes: restantes });
   }
-
-  const pendentesRestantes = await contarPendentes();
-  _processando = false;
-  set({ sincronizando: false, ultimaSync: new Date(), pendentes: pendentesRestantes, erros: falha });
-
-  salvarHistoricoSync({
-    ts: new Date().toISOString(),
-    sucesso,
-    falha,
-    pendentes: pendentesRestantes,
-  });
 
   return { sucesso, falha };
 }
 
-async function executarOperacao(op: OperacaoFila) {
+async function executarOperacao(op: ItemFila) {
   switch (op.operacao) {
-    case "insert": {
-      // Remove campos calculados pelo banco
-      const { id: _id, total: _t, subtotal: _s, taxa_servico: _ts, ...payload } = op.payload as any;
 
-      // Verifica se o registro já existe no banco (pode ter sido enviado antes de falhar o ack)
-      // Isso evita duplicatas em caso de retry
-      if (op.tabela === "comanda_itens" && payload.comanda_id && payload.nome_produto) {
-        const { data: existe } = await supabase
-          .from("comanda_itens")
-          .select("id")
-          .eq("comanda_id", payload.comanda_id)
-          .eq("nome_produto", payload.nome_produto)
-          .eq("quantidade", payload.quantidade)
-          .eq("preco_unit", payload.preco_unit)
-          .eq("cancelado", false)
-          .limit(1);
-        if (existe && existe.length > 0) {
-          // Já existe no banco — só atualiza local e remove da fila
-          const storeLocal = STORES.comanda_itens;
-          await dbDelete(storeLocal, op.record_id);
-          await dbPut(storeLocal, { ...payload, id: existe[0].id });
-          console.log("[Sync] Item já existia no banco, pulando insert duplicado");
-          break;
-        }
+    case "insert": {
+      // Limpa campos calculados pelo banco antes de enviar
+      const payload = { ...op.payload } as any;
+      delete payload.id;
+      delete payload.total;
+      delete payload.subtotal;
+      delete payload.taxa_servico;
+      delete payload.solicitou_fechamento;
+
+      // ── Guarda contra inserção duplicada ──────────────────────────────────
+      // Se o comanda_id ainda é um ID temporário, a comanda ainda não chegou
+      // no banco. O loop do while vai processar a comanda primeiro (prioridade 2
+      // antes de 3), então isso só acontece se houver bug. Mas defende mesmo assim.
+      if (op.tabela === "comanda_itens" && isTempId(payload.comanda_id ?? "")) {
+        throw new Error("comanda_id ainda é temporário — aguardando sync da comanda");
       }
 
       const { data, error } = await supabase
@@ -181,30 +148,32 @@ async function executarOperacao(op: OperacaoFila) {
         .single();
 
       if (error) throw error;
+      if (!data)  throw new Error("Banco não retornou dados após insert");
 
-      // Se o ID real é diferente do ID temporário, atualiza tudo
-      if (data && data.id !== op.record_id) {
-        const storeMap: Record<string, string> = {
-          comandas:      STORES.comandas,
-          comanda_itens: STORES.comanda_itens,
-          mesas:         STORES.mesas,
-        };
-        const store = storeMap[op.tabela];
-        if (store) {
-          // Salva o real ANTES de apagar o temp — nunca perde o dado
-          await dbPut(store, data);
-          await dbDelete(store, op.record_id);
+      // ── Atualiza IndexedDB com o ID real ──────────────────────────────────
+      const storeMap: Record<string, string> = {
+        comandas:      STORES.comandas,
+        comanda_itens: STORES.comanda_itens,
+        mesas:         STORES.mesas,
+      };
+      const store = storeMap[op.tabela];
+      if (store) {
+        await dbPut(store, data);                      // salva real
+        if (isTempId(op.record_id)) {
+          await dbDelete(store, op.record_id);         // remove temp só depois
         }
+      }
 
-        // Atualiza referências na fila
-        await atualizarIdNaFila(op.record_id, data.id, op.tabela);
+      // ── Propaga o novo ID para o restante da fila ─────────────────────────
+      if (isTempId(op.record_id) && data.id !== op.record_id) {
+        await substituirIdNaFila(op.record_id, data.id, op.tabela);
 
-        // Atualiza comanda_itens locais que usavam o ID temp da comanda
+        // Atualiza comanda_itens locais que tinham comanda_id temporário
         if (op.tabela === "comandas") {
           const itens = await dbGetAll<any>(STORES.comanda_itens);
-          const desatualizados = itens.filter(i => i.comanda_id === op.record_id);
-          if (desatualizados.length > 0) {
-            await dbPutMany(STORES.comanda_itens, desatualizados.map(i => ({ ...i, comanda_id: data.id })));
+          const velhos = itens.filter(i => i.comanda_id === op.record_id);
+          if (velhos.length > 0) {
+            await dbPutMany(STORES.comanda_itens, velhos.map(i => ({ ...i, comanda_id: data.id })));
           }
         }
       }
@@ -212,6 +181,11 @@ async function executarOperacao(op: OperacaoFila) {
     }
 
     case "update": {
+      // Se o record_id ainda é temporário, a entidade não chegou ao banco ainda
+      // Isso não deveria acontecer devido à ordenação, mas defendemos
+      if (isTempId(op.record_id)) {
+        throw new Error(`record_id temporário em update: ${op.record_id}`);
+      }
       const { error } = await supabase
         .from(op.tabela as any)
         .update(op.payload)
@@ -221,6 +195,15 @@ async function executarOperacao(op: OperacaoFila) {
     }
 
     case "delete": {
+      if (isTempId(op.record_id)) {
+        // Nunca chegou ao banco — só apaga local
+        const storeMap: Record<string, string> = {
+          comandas: STORES.comandas, comanda_itens: STORES.comanda_itens,
+        };
+        const store = storeMap[op.tabela];
+        if (store) await dbDelete(store, op.record_id);
+        return;
+      }
       const { error } = await supabase
         .from(op.tabela as any)
         .delete()
@@ -231,10 +214,19 @@ async function executarOperacao(op: OperacaoFila) {
   }
 }
 
-// ─── Re-hidratação após sync ──────────────────────────────────────────────────
+// ─── Rehydrate — NUNCA sobrescreve dados com IDs temporários ─────────────────
 
 export async function rehydratar(): Promise<void> {
   if (!navigator.onLine) return;
+
+  // Verifica se há pendentes com IDs temporários — nesse caso não rehydrata
+  // para não sobrescrever dados locais que ainda não foram para o banco
+  const pendentes = await getPendentes();
+  if (pendentes.some(p => isTempId(p.record_id))) {
+    console.log("[Sync] Rehydrate adiado — há IDs temporários na fila");
+    return;
+  }
+
   try {
     const [
       { data: mesas },
@@ -245,34 +237,36 @@ export async function rehydratar(): Promise<void> {
       supabase.from("mesas").select("*").order("numero"),
       supabase.from("produtos").select("*, categorias(nome)").eq("ativo", true).order("nome"),
       supabase.from("categorias").select("*").eq("ativo", true).order("nome"),
-      supabase.from("funcionarios").select("id, nome, usuario, funcao, ativo, senha_hash").eq("ativo", true),
+      supabase.from("funcionarios").select("id,nome,usuario,funcao,ativo,senha_hash").eq("ativo", true),
     ]);
 
-    if (mesas)       await dbPutMany(STORES.mesas, mesas);
-    if (produtos)    await dbPutMany(STORES.produtos, produtos);
-    if (categorias)  await dbPutMany(STORES.categorias, categorias);
+    if (mesas)        await dbPutMany(STORES.mesas, mesas);
+    if (produtos)     await dbPutMany(STORES.produtos, produtos);
+    if (categorias)   await dbPutMany(STORES.categorias, categorias);
     if (funcionarios) await dbPutMany(STORES.funcionarios, funcionarios);
 
-    // Comandas abertas
+    // Comandas abertas — busca os IDs reais do banco
     const { data: comandas } = await supabase
       .from("comandas")
       .select("*")
       .in("status", ["aberta", "fechando"]);
-    if (comandas) {
+
+    if (comandas && comandas.length > 0) {
       await dbPutMany(STORES.comandas, comandas);
-      if (comandas.length > 0) {
-        const ids = comandas.map((c: any) => c.id);
-        const { data: itens } = await supabase
-          .from("comanda_itens")
-          .select("*")
-          .in("comanda_id", ids)
-          .eq("cancelado", false);
-        if (itens) await dbPutMany(STORES.comanda_itens, itens);
-      }
+
+      const ids = comandas.map((c: any) => c.id);
+      const { data: itens } = await supabase
+        .from("comanda_itens")
+        .select("*")
+        .in("comanda_id", ids)
+        .eq("cancelado", false);
+
+      if (itens) await dbPutMany(STORES.comanda_itens, itens);
     }
 
     set({ ultimaSync: new Date() });
+    console.log("[Sync] Rehydrate concluído");
   } catch (err) {
-    console.error("[Sync] Erro ao re-hidratar:", err);
+    console.error("[Sync] Erro no rehydrate:", err);
   }
 }
