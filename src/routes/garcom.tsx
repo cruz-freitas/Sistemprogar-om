@@ -128,6 +128,9 @@ function GarcomApp() {
     channel.on("postgres_changes", { event: "*", schema: "public", table: "comandas" }, () => {
       getMesasComComandas().then(setMesas).catch(() => {});
     });
+    channel.on("postgres_changes", { event: "*", schema: "public", table: "comanda_itens" }, () => {
+      getMesasComComandas().then(setMesas).catch(() => {});
+    });
     channel.on("postgres_changes", { event: "*", schema: "public", table: "produtos" }, () => {
       getProdutos().then(setProdutos).catch(() => {});
     });
@@ -137,7 +140,34 @@ function GarcomApp() {
 
     channel.subscribe();
 
-    return () => { channel.unsubscribe(); };
+    // Quando o sync terminar (volta de offline), recarrega tudo
+    const onRehydrate = () => {
+      getMesasComComandas().then(setMesas).catch(() => {});
+      getProdutos().then(setProdutos).catch(() => {});
+      getCategorias().then(setCategorias).catch(() => {});
+    };
+    const onOnline = () => {
+      // Aguarda o sync processar antes de recarregar
+      setTimeout(() => {
+        getMesasComComandas().then(setMesas).catch(() => {});
+      }, 3000);
+    };
+
+    const onSyncDone = () => {
+      // Sync completou — recarrega mesas e itens do modal se estiver aberto
+      getMesasComComandas().then(setMesas).catch(() => {});
+    };
+
+    window.addEventListener("bb:rehydrate", onRehydrate);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("bb:sync-done", onSyncDone);
+
+    return () => {
+      channel.unsubscribe();
+      window.removeEventListener("bb:rehydrate", onRehydrate);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("bb:sync-done", onSyncDone);
+    };
   }, [sessao]);
 
   // ─── Auto-refresh a cada 30s ───────────────────────────────────────────────
