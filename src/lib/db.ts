@@ -1,15 +1,22 @@
 /**
- * db.ts — Camada de dados simplificada e robusta
+ * db.ts — Camada de dados offline-first
  * 
- * Princípios:
- * - Direto ao Supabase (sem fila offline complexa que causava problemas)
- * - Retry automático em caso de falha de rede
- * - Cache local no localStorage apenas para dados estáticos (produtos, categorias)
- * - Realtime do Supabase para mesas, comandas e chamadas
+ * FLUXO:
+ * 1. Toda operação salva LOCAL (IndexedDB) imediatamente → UI responde na hora
+ * 2. Se online → tenta enviar ao Supabase em paralelo
+ * 3. Se offline → enfileira para sync posterior
+ * 4. Ao reconectar → processa fila em ordem de prioridade
  */
 
 import { supabase } from "./supabase";
-import type { Mesa, Comanda, ComandaItem, Produto, Categoria, Funcionario } from "./supabase";
+import type { Mesa, Comanda, ComandaItem, Produto, Categoria } from "./supabase";
+import {
+  dbGet, dbGetAll, dbGetByIndex, dbPut, dbPutMany, dbDelete,
+  enfileirar, STORES,
+} from "./offline-queue";
+
+const online = () => navigator.onLine;
+const tempId = () => "temp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
 
 // ─── Sessão ───────────────────────────────────────────────────────────────────
 
@@ -39,103 +46,134 @@ export function limparSessao() {
   sessionStorage.removeItem(SESSION_KEY);
 }
 
-// ─── Login ───────────────────────────────────────────────────────────────────
+// ─── Login ────────────────────────────────────────────────────────────────────
 
 export async function fazerLogin(usuario: string, senha: string): Promise<Sessao | null> {
-  // Hash SHA-256 da senha
   const encoder = new TextEncoder();
   const data = encoder.encode(senha);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   const senhaHash = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 
-  const { data: func, error } = await supabase
-    .from("funcionarios")
-    .select("id, nome, usuario, funcao")
-    .eq("usuario", usuario)
-    .eq("senha_hash", senhaHash)
-    .eq("ativo", true)
-    .single();
+  // Tenta online primeiro
+  if (online()) {
+    const { data: func } = await supabase
+      .from("funcionarios")
+      .select("id, nome, usuario, funcao")
+      .eq("usuario", usuario)
+      .eq("senha_hash", senhaHash)
+      .eq("ativo", true)
+      .single();
 
-  if (error || !func) return null;
+    if (func) {
+      // Salva no IndexedDB para login offline futuro
+      await dbPut(STORES.funcionarios, { ...func, senha_hash: senhaHash });
+      const sessao = { id: func.id, nome: func.nome, usuario: func.usuario, funcao: func.funcao as Sessao["funcao"] };
+      salvarSessao(sessao);
+      return sessao;
+    }
+    return null;
+  }
 
-  const sessao: Sessao = {
-    id: func.id,
-    nome: func.nome,
-    usuario: func.usuario,
-    funcao: func.funcao as Sessao["funcao"],
-  };
+  // Offline: busca no IndexedDB
+  const funcionarios = await dbGetAll<any>(STORES.funcionarios);
+  const func = funcionarios.find(f => f.usuario === usuario && f.senha_hash === senhaHash && f.ativo !== false);
+  if (!func) return null;
+
+  const sessao = { id: func.id, nome: func.nome, usuario: func.usuario, funcao: func.funcao as Sessao["funcao"] };
   salvarSessao(sessao);
   return sessao;
-}
-
-// ─── Retry helper ─────────────────────────────────────────────────────────────
-
-async function comRetry<T>(fn: () => Promise<T>, tentativas = 3): Promise<T> {
-  let ultimo: unknown;
-  for (let i = 0; i < tentativas; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      ultimo = err;
-      if (i < tentativas - 1) await new Promise(r => setTimeout(r, 800 * (i + 1)));
-    }
-  }
-  throw ultimo;
 }
 
 // ─── Mesas ────────────────────────────────────────────────────────────────────
 
 export async function getMesasComComandas(): Promise<Array<Mesa & { comandas: Comanda[] }>> {
-  return comRetry(async () => {
-    const { data: mesas, error: e1 } = await supabase
-      .from("mesas")
-      .select("*")
-      .order("numero");
-    if (e1) throw e1;
-    if (!mesas) return [];
-
-    const ocupadas = mesas.filter(m => m.status !== "livre").map(m => m.id);
-
-    if (ocupadas.length === 0) {
-      return mesas.map(m => ({ ...m, comandas: [] }));
-    }
-
-    const { data: comandas } = await supabase
-      .from("comandas")
-      .select("id, codigo, cliente_nome, total, solicitou_fechamento, mesa_id, status, subtotal, taxa_servico, aberta_em, funcionario_id, fechada_em, created_at")
-      .in("mesa_id", ocupadas)
-      .eq("status", "aberta");
-
-    const cmdMap: Record<string, Comanda[]> = {};
-    (comandas ?? []).forEach((c: Comanda) => {
-      if (c.mesa_id) {
-        if (!cmdMap[c.mesa_id]) cmdMap[c.mesa_id] = [];
-        cmdMap[c.mesa_id].push(c);
+  if (online()) {
+    try {
+      const { data: mesas, error } = await supabase.from("mesas").select("*").order("numero");
+      if (!error && mesas) {
+        await dbPutMany(STORES.mesas, mesas);
+        const ocupadas = mesas.filter(m => m.status !== "livre").map(m => m.id);
+        if (ocupadas.length > 0) {
+          const { data: comandas } = await supabase
+            .from("comandas")
+            .select("id, codigo, cliente_nome, total, solicitou_fechamento, mesa_id, status, subtotal, taxa_servico, aberta_em, funcionario_id, fechada_em, created_at")
+            .in("mesa_id", ocupadas)
+            .eq("status", "aberta");
+          if (comandas) await dbPutMany(STORES.comandas, comandas);
+          const cmdMap: Record<string, Comanda[]> = {};
+          (comandas ?? []).forEach((c: any) => {
+            if (c.mesa_id) { if (!cmdMap[c.mesa_id]) cmdMap[c.mesa_id] = []; cmdMap[c.mesa_id].push(c); }
+          });
+          return mesas.map(m => ({ ...m, comandas: cmdMap[m.id] ?? [] }));
+        }
+        return mesas.map(m => ({ ...m, comandas: [] }));
       }
-    });
+    } catch {}
+  }
 
-    return mesas.map(m => ({ ...m, comandas: cmdMap[m.id] ?? [] }));
-  });
+  // Offline: usa IndexedDB
+  const mesas = await dbGetAll<Mesa>(STORES.mesas);
+  const comandas = await dbGetAll<Comanda>(STORES.comandas);
+  const abertas = comandas.filter(c => c.status === "aberta");
+  const cmdMap: Record<string, Comanda[]> = {};
+  abertas.forEach(c => { if (c.mesa_id) { if (!cmdMap[c.mesa_id]) cmdMap[c.mesa_id] = []; cmdMap[c.mesa_id].push(c); } });
+  return mesas.sort((a, b) => a.numero - b.numero).map(m => ({ ...m, comandas: cmdMap[m.id] ?? [] }));
 }
 
 export async function atualizarStatusMesa(id: string, status: Mesa["status"]) {
-  return comRetry(async () => {
+  // Local imediato
+  const mesa = await dbGet<Mesa>(STORES.mesas, id);
+  if (mesa) await dbPut(STORES.mesas, { ...mesa, status });
+
+  if (online()) {
     const { error } = await supabase.from("mesas").update({ status }).eq("id", id);
-    if (error) throw error;
-  });
+    if (error) await enfileirar({ tabela: "mesas", operacao: "update", record_id: id, payload: { status } });
+  } else {
+    await enfileirar({ tabela: "mesas", operacao: "update", record_id: id, payload: { status } });
+  }
+}
+
+// ─── Produtos e Categorias ────────────────────────────────────────────────────
+
+export async function getProdutos(): Promise<Produto[]> {
+  if (online()) {
+    try {
+      const { data, error } = await supabase
+        .from("produtos").select("*, categorias(nome)").eq("ativo", true).order("nome");
+      if (!error && data) { await dbPutMany(STORES.produtos, data); return data as Produto[]; }
+    } catch {}
+  }
+  const local = await dbGetAll<Produto>(STORES.produtos);
+  return local.filter(p => p.ativo !== false);
+}
+
+export async function getCategorias(): Promise<Categoria[]> {
+  if (online()) {
+    try {
+      const { data, error } = await supabase.from("categorias").select("*").eq("ativo", true).order("nome");
+      if (!error && data) { await dbPutMany(STORES.categorias, data); return data as Categoria[]; }
+    } catch {}
+  }
+  const local = await dbGetAll<Categoria>(STORES.categorias);
+  return local.filter(c => c.ativo !== false);
 }
 
 // ─── Comandas ─────────────────────────────────────────────────────────────────
 
 export async function verificarFicha(codigo: string): Promise<"disponivel" | "ocupada"> {
-  const { data } = await supabase
-    .from("comandas")
-    .select("id")
-    .eq("codigo", codigo)
-    .eq("status", "aberta")
-    .limit(1);
-  return (data && data.length > 0) ? "ocupada" : "disponivel";
+  // Verifica local primeiro (inclui comandas abertas offline)
+  const local = await dbGetAll<Comanda>(STORES.comandas);
+  const existeLocal = local.some(c => c.codigo === codigo && c.status === "aberta");
+  if (existeLocal) return "ocupada";
+
+  // Se online, confirma no banco
+  if (online()) {
+    const { data } = await supabase
+      .from("comandas").select("id").eq("codigo", codigo).eq("status", "aberta").limit(1);
+    return (data && data.length > 0) ? "ocupada" : "disponivel";
+  }
+  return "disponivel";
 }
 
 export async function abrirComanda(params: {
@@ -144,29 +182,55 @@ export async function abrirComanda(params: {
   cliente_nome: string;
   funcionario_id: string;
 }): Promise<Comanda> {
-  return comRetry(async () => {
-    // Abre a comanda
-    const { data, error } = await supabase
-      .from("comandas")
-      .insert({
-        codigo: params.codigo,
-        mesa_id: params.mesa_id,
-        cliente_nome: params.cliente_nome,
-        funcionario_id: params.funcionario_id,
-        status: "aberta",
-        subtotal: 0,
-        taxa_servico: 0,
-        total: 0,
-      })
-      .select()
-      .single();
-    if (error) throw error;
+  const id = tempId();
+  const agora = new Date().toISOString();
 
-    // Marca mesa como ocupada
-    await supabase.from("mesas").update({ status: "ocupada" }).eq("id", params.mesa_id);
+  const comanda: Comanda = {
+    id,
+    codigo: params.codigo,
+    mesa_id: params.mesa_id,
+    cliente_nome: params.cliente_nome,
+    funcionario_id: params.funcionario_id,
+    status: "aberta",
+    subtotal: 0,
+    taxa_servico: 0,
+    total: 0,
+    solicitou_fechamento: false,
+    aberta_em: agora,
+    fechada_em: null,
+    created_at: agora,
+    forma_pagamento: null,
+  };
 
-    return data as Comanda;
-  });
+  // Salva local imediatamente
+  await dbPut(STORES.comandas, comanda);
+  await atualizarStatusMesa(params.mesa_id, "ocupada");
+
+  const payload = {
+    codigo: params.codigo,
+    mesa_id: params.mesa_id,
+    cliente_nome: params.cliente_nome,
+    funcionario_id: params.funcionario_id,
+    status: "aberta",
+    aberta_em: agora,
+  };
+
+  if (online()) {
+    try {
+      const { data, error } = await supabase
+        .from("comandas").insert(payload).select().single();
+      if (!error && data) {
+        // Substitui ID temporário pelo real
+        await dbDelete(STORES.comandas, id);
+        await dbPut(STORES.comandas, data);
+        return data as Comanda;
+      }
+    } catch {}
+  }
+
+  // Offline: enfileira
+  await enfileirar({ tabela: "comandas", operacao: "insert", record_id: id, payload });
+  return comanda;
 }
 
 export async function inserirItens(comandaId: string, itens: Array<{
@@ -175,225 +239,198 @@ export async function inserirItens(comandaId: string, itens: Array<{
   preco_unit: number;
   quantidade: number;
 }>): Promise<void> {
-  return comRetry(async () => {
-    const rows = itens.map(i => ({
-      comanda_id: comandaId,
-      produto_id: i.produto_id,
-      nome_produto: i.nome_produto,
-      preco_unit: i.preco_unit,
-      quantidade: i.quantidade,
-      total: +(i.preco_unit * i.quantidade).toFixed(2),
-      cancelado: false,
-    }));
+  const agora = new Date().toISOString();
 
-    const { error } = await supabase.from("comanda_itens").insert(rows);
-    if (error) throw error;
-    // O trigger do banco já atualiza o total da comanda automaticamente
-  });
+  const rows = itens.map(i => ({
+    id: tempId(),
+    comanda_id: comandaId,
+    produto_id: i.produto_id,
+    nome_produto: i.nome_produto,
+    preco_unit: i.preco_unit,
+    quantidade: i.quantidade,
+    total: +(i.preco_unit * i.quantidade).toFixed(2),
+    cancelado: false,
+    created_at: agora,
+  }));
+
+  // Salva local imediatamente
+  await dbPutMany(STORES.comanda_itens, rows);
+
+  // Atualiza total local da comanda
+  const todosItens = await dbGetByIndex<ComandaItem>(STORES.comanda_itens, "comanda_id", comandaId);
+  const subtotal = todosItens.filter(i => !i.cancelado).reduce((s, i) => s + Number(i.total), 0);
+  const comanda = await dbGet<Comanda>(STORES.comandas, comandaId);
+  if (comanda) {
+    await dbPut(STORES.comandas, {
+      ...comanda,
+      subtotal,
+      taxa_servico: +(subtotal * 0.1).toFixed(2),
+      total: +(subtotal * 1.1).toFixed(2),
+    });
+  }
+
+  if (online()) {
+    try {
+      const { error } = await supabase.from("comanda_itens").insert(
+        rows.map(({ id: _id, ...r }) => r)
+      );
+      if (!error) {
+        // Remove IDs temp e busca os reais
+        for (const row of rows) await dbDelete(STORES.comanda_itens, row.id);
+        const { data: inseridos } = await supabase
+          .from("comanda_itens").select("*")
+          .eq("comanda_id", comandaId)
+          .gte("created_at", agora);
+        if (inseridos) await dbPutMany(STORES.comanda_itens, inseridos);
+        return;
+      }
+    } catch {}
+  }
+
+  // Offline: enfileira cada item
+  for (const row of rows) {
+    await enfileirar({
+      tabela: "comanda_itens",
+      operacao: "insert",
+      record_id: row.id,
+      payload: {
+        comanda_id: row.comanda_id,
+        produto_id: row.produto_id,
+        nome_produto: row.nome_produto,
+        preco_unit: row.preco_unit,
+        quantidade: row.quantidade,
+        total: row.total,
+        cancelado: false,
+      },
+    });
+  }
 }
 
 export async function getItensDaComanda(comandaId: string): Promise<ComandaItem[]> {
-  const { data, error } = await supabase
-    .from("comanda_itens")
-    .select("*")
-    .eq("comanda_id", comandaId)
-    .order("created_at");
-  if (error) throw error;
-  return (data ?? []) as ComandaItem[];
+  if (online()) {
+    try {
+      const { data, error } = await supabase
+        .from("comanda_itens").select("*").eq("comanda_id", comandaId).order("created_at");
+      if (!error && data) { await dbPutMany(STORES.comanda_itens, data); return data as ComandaItem[]; }
+    } catch {}
+  }
+  const local = await dbGetByIndex<ComandaItem>(STORES.comanda_itens, "comanda_id", comandaId);
+  return local.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 }
 
 export async function solicitarFechamento(comandaId: string): Promise<void> {
-  return comRetry(async () => {
-    const { error } = await supabase
-      .from("comandas")
-      .update({ solicitou_fechamento: true, status: "fechando" })
-      .eq("id", comandaId);
-    if (error) throw error;
-  });
+  const comanda = await dbGet<Comanda>(STORES.comandas, comandaId);
+  if (comanda) await dbPut(STORES.comandas, { ...comanda, solicitou_fechamento: true, status: "fechando" });
+
+  if (online()) {
+    const { error } = await supabase.from("comandas")
+      .update({ solicitou_fechamento: true, status: "fechando" }).eq("id", comandaId);
+    if (error) await enfileirar({ tabela: "comandas", operacao: "update", record_id: comandaId, payload: { solicitou_fechamento: true, status: "fechando" } });
+  } else {
+    await enfileirar({ tabela: "comandas", operacao: "update", record_id: comandaId, payload: { solicitou_fechamento: true, status: "fechando" } });
+  }
 }
 
 export async function fecharComanda(comandaId: string, formaPagamento: string): Promise<void> {
-  return comRetry(async () => {
-    // Pega o total atual
-    const { data: cmd } = await supabase
-      .from("comandas")
-      .select("total, mesa_id")
-      .eq("id", comandaId)
-      .single();
+  const comanda = await dbGet<Comanda>(STORES.comandas, comandaId);
+  const mesaId = comanda?.mesa_id;
 
-    const { error } = await supabase
-      .from("comandas")
-      .update({
-        status: "fechada",
-        forma_pagamento: formaPagamento,
-        fechada_em: new Date().toISOString(),
-      })
-      .eq("id", comandaId);
-    if (error) throw error;
+  if (comanda) await dbPut(STORES.comandas, { ...comanda, status: "fechada", forma_pagamento: formaPagamento, fechada_em: new Date().toISOString() });
 
-    // Libera a mesa se não há mais comandas abertas
-    if (cmd?.mesa_id) {
-      const { data: outras } = await supabase
-        .from("comandas")
-        .select("id")
-        .eq("mesa_id", cmd.mesa_id)
-        .in("status", ["aberta", "fechando"])
-        .neq("id", comandaId);
-      if (!outras || outras.length === 0) {
-        await supabase.from("mesas").update({ status: "livre" }).eq("id", cmd.mesa_id);
-      }
+  const payload = { status: "fechada", forma_pagamento: formaPagamento, fechada_em: new Date().toISOString() };
+
+  if (online()) {
+    const { error } = await supabase.from("comandas").update(payload).eq("id", comandaId);
+    if (error) await enfileirar({ tabela: "comandas", operacao: "update", record_id: comandaId, payload });
+    // Libera mesa se não há mais abertas
+    if (mesaId) {
+      const { data: outras } = await supabase.from("comandas")
+        .select("id").eq("mesa_id", mesaId).in("status", ["aberta", "fechando"]).neq("id", comandaId);
+      if (!outras || outras.length === 0) await atualizarStatusMesa(mesaId, "livre");
     }
-  });
+  } else {
+    await enfileirar({ tabela: "comandas", operacao: "update", record_id: comandaId, payload });
+    if (mesaId) {
+      const local = await dbGetAll<Comanda>(STORES.comandas);
+      const outras = local.filter(c => c.mesa_id === mesaId && ["aberta", "fechando"].includes(c.status) && c.id !== comandaId);
+      if (outras.length === 0) await atualizarStatusMesa(mesaId, "livre");
+    }
+  }
 }
 
 export async function cancelarComanda(comandaId: string): Promise<void> {
-  return comRetry(async () => {
-    const { data: cmd } = await supabase
-      .from("comandas")
-      .select("mesa_id")
-      .eq("id", comandaId)
-      .single();
+  const comanda = await dbGet<Comanda>(STORES.comandas, comandaId);
+  const mesaId = comanda?.mesa_id;
+  if (comanda) await dbPut(STORES.comandas, { ...comanda, status: "cancelada" });
 
-    const { error } = await supabase
-      .from("comandas")
-      .update({ status: "cancelada" })
-      .eq("id", comandaId);
-    if (error) throw error;
-
-    if (cmd?.mesa_id) {
-      const { data: outras } = await supabase
-        .from("comandas")
-        .select("id")
-        .eq("mesa_id", cmd.mesa_id)
-        .in("status", ["aberta", "fechando"])
-        .neq("id", comandaId);
-      if (!outras || outras.length === 0) {
-        await supabase.from("mesas").update({ status: "livre" }).eq("id", cmd.mesa_id);
-      }
+  if (online()) {
+    await supabase.from("comandas").update({ status: "cancelada" }).eq("id", comandaId);
+    if (mesaId) {
+      const { data: outras } = await supabase.from("comandas")
+        .select("id").eq("mesa_id", mesaId).in("status", ["aberta", "fechando"]).neq("id", comandaId);
+      if (!outras || outras.length === 0) await atualizarStatusMesa(mesaId, "livre");
     }
-  });
-}
-
-// ─── Produtos e Categorias ────────────────────────────────────────────────────
-
-const CACHE_PRODUTOS_KEY = "sp_cache_produtos";
-const CACHE_CAT_KEY = "sp_cache_categorias";
-const CACHE_TTL = 0; // sem cache — sempre busca fresco
-
-export async function getProdutos(): Promise<Produto[]> {
-  // Tenta cache
-  try {
-    const cached = localStorage.getItem(CACHE_PRODUTOS_KEY);
-    if (cached) {
-      const { ts, data } = JSON.parse(cached);
-      if (Date.now() - ts < CACHE_TTL) return data;
+  } else {
+    await enfileirar({ tabela: "comandas", operacao: "update", record_id: comandaId, payload: { status: "cancelada" } });
+    if (mesaId) {
+      const local = await dbGetAll<Comanda>(STORES.comandas);
+      const outras = local.filter(c => c.mesa_id === mesaId && ["aberta", "fechando"].includes(c.status) && c.id !== comandaId);
+      if (outras.length === 0) await atualizarStatusMesa(mesaId, "livre");
     }
-  } catch {}
-
-  const { data, error } = await supabase
-    .from("produtos")
-    .select("*, categorias(nome)")
-    .eq("ativo", true)
-    .order("nome");
-
-  if (error) {
-    // Retorna cache antigo se houver
-    try {
-      const cached = localStorage.getItem(CACHE_PRODUTOS_KEY);
-      if (cached) return JSON.parse(cached).data;
-    } catch {}
-    return [];
   }
-
-  try {
-    localStorage.setItem(CACHE_PRODUTOS_KEY, JSON.stringify({ ts: Date.now(), data }));
-  } catch {}
-  return (data ?? []) as Produto[];
 }
 
-export async function getCategorias(): Promise<Categoria[]> {
-  try {
-    const cached = localStorage.getItem(CACHE_CAT_KEY);
-    if (cached) {
-      const { ts, data } = JSON.parse(cached);
-      if (Date.now() - ts < CACHE_TTL) return data;
-    }
-  } catch {}
-
-  const { data, error } = await supabase
-    .from("categorias")
-    .select("*")
-    .eq("ativo", true)
-    .order("nome");
-
-  if (error) {
-    try {
-      const cached = localStorage.getItem(CACHE_CAT_KEY);
-      if (cached) return JSON.parse(cached).data;
-    } catch {}
-    return [];
-  }
-
-  try {
-    localStorage.setItem(CACHE_CAT_KEY, JSON.stringify({ ts: Date.now(), data }));
-  } catch {}
-  return (data ?? []) as Categoria[];
-}
-
-export function invalidarCacheProdutos() {
-  localStorage.removeItem(CACHE_PRODUTOS_KEY);
-  localStorage.removeItem(CACHE_CAT_KEY);
-}
-
-// ─── Chamadas de garçom ───────────────────────────────────────────────────────
+// ─── Chamadas de garçom ────────────────────────────────────────────────────────
 
 export async function chamarGarcom(params: {
   mesa_id: string;
   mesa_numero: number;
-  cliente_nome?: string;
-  codigo_comanda?: string;
+  cliente_nome?: string | null;
+  codigo_comanda?: string | null;
 }): Promise<void> {
-  return comRetry(async () => {
-    const { error } = await supabase.from("chamadas_garcom").insert({
-      mesa_id: params.mesa_id,
-      mesa_numero: params.mesa_numero,
-      cliente_nome: params.cliente_nome ?? null,
-      codigo_comanda: params.codigo_comanda ?? null,
-      status: "pendente",
-    });
+  const payload = {
+    mesa_id: params.mesa_id,
+    mesa_numero: params.mesa_numero,
+    cliente_nome: params.cliente_nome ?? null,
+    codigo_comanda: params.codigo_comanda ?? null,
+    status: "pendente",
+  };
+
+  if (online()) {
+    const { error } = await supabase.from("chamadas_garcom").insert(payload);
     if (error) throw error;
-  });
+  } else {
+    await enfileirar({ tabela: "chamadas_garcom", operacao: "insert", record_id: tempId(), payload });
+  }
 }
 
 export async function atenderChamada(id: string, funcionarioId?: string | null): Promise<void> {
-  const { error } = await supabase
-    .from("chamadas_garcom")
-    .update({
-      status: "atendida",
-      atendida_por: funcionarioId ?? null,
-      atendida_em: new Date().toISOString(),
-    })
-    .eq("id", id);
-  if (error) throw error;
+  if (online()) {
+    await supabase.from("chamadas_garcom").update({
+      status: "atendida", atendida_por: funcionarioId ?? null, atendida_em: new Date().toISOString(),
+    }).eq("id", id);
+  } else {
+    await enfileirar({ tabela: "chamadas_garcom", operacao: "update", record_id: id, payload: { status: "atendida", atendida_em: new Date().toISOString() } });
+  }
 }
 
 export async function atenderTodasChamadas(funcionarioId?: string | null): Promise<void> {
-  const { error } = await supabase
-    .from("chamadas_garcom")
-    .update({
-      status: "atendida",
-      atendida_por: funcionarioId ?? null,
-      atendida_em: new Date().toISOString(),
-    })
-    .eq("status", "pendente");
-  if (error) throw error;
+  if (online()) {
+    await supabase.from("chamadas_garcom").update({
+      status: "atendida", atendida_por: funcionarioId ?? null, atendida_em: new Date().toISOString(),
+    }).eq("status", "pendente");
+  }
 }
 
 export async function getChamadasPendentes() {
-  const { data } = await supabase
-    .from("chamadas_garcom")
-    .select("*")
-    .eq("status", "pendente")
-    .order("created_at", { ascending: true });
-  return data ?? [];
+  if (online()) {
+    const { data } = await supabase.from("chamadas_garcom")
+      .select("*").eq("status", "pendente").order("created_at", { ascending: true });
+    return data ?? [];
+  }
+  return [];
+}
+
+export function invalidarCacheProdutos() {
+  // Não há mais cache local — produtos são buscados do IndexedDB
 }
