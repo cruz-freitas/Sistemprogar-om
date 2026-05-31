@@ -271,23 +271,44 @@ export async function inserirItens(comandaId: string, itens: Array<{
 
   if (online()) {
     try {
-      const { error } = await supabase.from("comanda_itens").insert(
-        rows.map(({ id: _id, ...r }) => r)
-      );
-      if (!error) {
-        // Remove IDs temp e busca os reais
-        for (const row of rows) await dbDelete(STORES.comanda_itens, row.id);
-        const { data: inseridos } = await supabase
-          .from("comanda_itens").select("*")
-          .eq("comanda_id", comandaId)
-          .gte("created_at", agora);
-        if (inseridos) await dbPutMany(STORES.comanda_itens, inseridos);
-        return;
+      // Insere um por um para pegar o ID real de cada um
+      const inseridos: ComandaItem[] = [];
+      for (const row of rows) {
+        const { id: _id, ...payload } = row;
+        const { data, error } = await supabase
+          .from("comanda_itens")
+          .insert(payload)
+          .select()
+          .single();
+
+        if (error) throw error;
+
+        // Substitui ID temporário pelo real
+        await dbDelete(STORES.comanda_itens, row.id);
+        await dbPut(STORES.comanda_itens, data);
+        inseridos.push(data as ComandaItem);
       }
-    } catch {}
+
+      // Atualiza total da comanda com os dados reais do banco
+      const todosReais = await dbGetByIndex<ComandaItem>(STORES.comanda_itens, "comanda_id", comandaId);
+      const subReal = todosReais.filter(i => !i.cancelado).reduce((s, i) => s + Number(i.total), 0);
+      const cmdReal = await dbGet<Comanda>(STORES.comandas, comandaId);
+      if (cmdReal) {
+        await dbPut(STORES.comandas, {
+          ...cmdReal,
+          subtotal: subReal,
+          taxa_servico: +(subReal * 0.1).toFixed(2),
+          total: +(subReal * 1.1).toFixed(2),
+        });
+      }
+      return;
+    } catch (err) {
+      console.error("[db] Erro ao inserir itens online, vai para fila:", err);
+      // NÃO apaga os locais — caem para a fila abaixo
+    }
   }
 
-  // Offline: enfileira cada item
+  // Offline ou falhou online: enfileira cada item (local já está salvo)
   for (const row of rows) {
     await enfileirar({
       tabela: "comanda_itens",
