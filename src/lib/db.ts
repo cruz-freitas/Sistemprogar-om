@@ -12,7 +12,7 @@ import { supabase } from "./supabase";
 import type { Mesa, Comanda, ComandaItem, Produto, Categoria } from "./supabase";
 import {
   dbGet, dbGetAll, dbGetByIndex, dbPut, dbPutMany, dbDelete,
-  enfileirar, STORES,
+  enfileirar, isTempId, STORES,
 } from "./offline-queue";
 
 const online = () => navigator.onLine;
