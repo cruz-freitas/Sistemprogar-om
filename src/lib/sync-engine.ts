@@ -152,6 +152,28 @@ async function executarOperacao(op: OperacaoFila) {
       // Remove campos calculados pelo banco
       const { id: _id, total: _t, subtotal: _s, taxa_servico: _ts, ...payload } = op.payload as any;
 
+      // Verifica se o registro já existe no banco (pode ter sido enviado antes de falhar o ack)
+      // Isso evita duplicatas em caso de retry
+      if (op.tabela === "comanda_itens" && payload.comanda_id && payload.nome_produto) {
+        const { data: existe } = await supabase
+          .from("comanda_itens")
+          .select("id")
+          .eq("comanda_id", payload.comanda_id)
+          .eq("nome_produto", payload.nome_produto)
+          .eq("quantidade", payload.quantidade)
+          .eq("preco_unit", payload.preco_unit)
+          .eq("cancelado", false)
+          .limit(1);
+        if (existe && existe.length > 0) {
+          // Já existe no banco — só atualiza local e remove da fila
+          const storeLocal = STORES.comanda_itens;
+          await dbDelete(storeLocal, op.record_id);
+          await dbPut(storeLocal, { ...payload, id: existe[0].id });
+          console.log("[Sync] Item já existia no banco, pulando insert duplicado");
+          break;
+        }
+      }
+
       const { data, error } = await supabase
         .from(op.tabela as any)
         .insert(payload)
@@ -169,14 +191,15 @@ async function executarOperacao(op: OperacaoFila) {
         };
         const store = storeMap[op.tabela];
         if (store) {
-          await dbDelete(store, op.record_id);
+          // Salva o real ANTES de apagar o temp — nunca perde o dado
           await dbPut(store, data);
+          await dbDelete(store, op.record_id);
         }
 
-        // Atualiza referências na fila (ex: comanda_itens que usavam ID temp da comanda)
+        // Atualiza referências na fila
         await atualizarIdNaFila(op.record_id, data.id, op.tabela);
 
-        // Atualiza comanda_itens locais que usavam o ID temp
+        // Atualiza comanda_itens locais que usavam o ID temp da comanda
         if (op.tabela === "comandas") {
           const itens = await dbGetAll<any>(STORES.comanda_itens);
           const desatualizados = itens.filter(i => i.comanda_id === op.record_id);
