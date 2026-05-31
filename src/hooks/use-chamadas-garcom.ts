@@ -1,10 +1,9 @@
 /**
  * use-chamadas-garcom.ts
- * Hook robusto para chamadas de garçom via Realtime do Supabase.
- * Toca alerta sonoro e mostra notificação em todos os dispositivos conectados.
+ * Canal Realtime singleton — evita erro de múltiplos subscribe()
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
 import { atenderChamada, atenderTodasChamadas, getChamadasPendentes } from "@/lib/db";
 
@@ -15,20 +14,32 @@ export type ChamadaPendente = {
   cliente_nome: string | null;
   codigo_comanda: string | null;
   created_at: string;
+  status: string;
 };
 
-// Toca som de alerta
-function tocarAlerta(vezes = 3) {
+// ─── Singleton global ─────────────────────────────────────────────────────────
+type Listener = (chamadas: ChamadaPendente[], novas: ChamadaPendente[]) => void;
+
+let _chamadas: ChamadaPendente[] = [];
+let _novas: ChamadaPendente[] = [];
+let _listeners: Listener[] = [];
+let _canal: ReturnType<typeof supabase.channel> | null = null;
+let _iniciado = false;
+
+function notificar() {
+  _listeners.forEach(fn => fn([..._chamadas], [..._novas]));
+}
+
+function tocarAlerta() {
   try {
     const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
     let t = ctx.currentTime;
-    for (let i = 0; i < vezes; i++) {
+    for (let i = 0; i < 3; i++) {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.frequency.value = 880;
-      osc.type = "sine";
       gain.gain.setValueAtTime(0.5, t);
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
       osc.start(t);
@@ -38,93 +49,117 @@ function tocarAlerta(vezes = 3) {
   } catch {}
 }
 
+function iniciarCanal() {
+  if (_iniciado) return;
+  _iniciado = true;
+
+  // Carrega pendentes iniciais
+  getChamadasPendentes().then(data => {
+    _chamadas = data as ChamadaPendente[];
+    notificar();
+  });
+
+  // Cria canal com listeners ANTES do subscribe
+  _canal = supabase.channel("chamadas-garcom-realtime");
+
+  _canal.on(
+    "postgres_changes" as any,
+    { event: "INSERT", schema: "public", table: "chamadas_garcom" },
+    (payload: any) => {
+      const nova = payload.new as ChamadaPendente;
+      if (nova.status !== "pendente") return;
+
+      if (!_chamadas.find(c => c.id === nova.id)) {
+        _chamadas = [..._chamadas, nova];
+      }
+      if (!_novas.find(c => c.id === nova.id)) {
+        _novas = [..._novas, nova];
+      }
+      notificar();
+      tocarAlerta();
+
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification(`🔔 Mesa ${nova.mesa_numero} chamando!`, {
+          body: nova.cliente_nome ?? "Toque para atender",
+          icon: "/icon-192x192.png",
+        });
+      }
+
+      setTimeout(() => {
+        _novas = _novas.filter(c => c.id !== nova.id);
+        notificar();
+      }, 25000);
+    }
+  );
+
+  _canal.on(
+    "postgres_changes" as any,
+    { event: "UPDATE", schema: "public", table: "chamadas_garcom" },
+    (payload: any) => {
+      const u = payload.new as { id: string; status: string };
+      if (u.status !== "pendente") {
+        _chamadas = _chamadas.filter(c => c.id !== u.id);
+        _novas = _novas.filter(c => c.id !== u.id);
+        notificar();
+      }
+    }
+  );
+
+  _canal.subscribe();
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
 export function useChamadasGarcom() {
-  const [chamadas, setChamadas] = useState<ChamadaPendente[]>([]);
-  const [novasChamadas, setNovasChamadas] = useState<ChamadaPendente[]>([]);
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const sessaoId = useRef<string | null>(null);
-
-  // Carrega sessão
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem("sp_session_v2") || sessionStorage.getItem("sp_session_v2");
-      if (raw) sessaoId.current = JSON.parse(raw)?.id ?? null;
-    } catch {}
-  }, []);
-
-  const carregar = useCallback(async () => {
-    const data = await getChamadasPendentes();
-    setChamadas(data as ChamadaPendente[]);
-  }, []);
+  const [chamadas, setChamadas] = useState<ChamadaPendente[]>(_chamadas);
+  const [novasChamadas, setNovasChamadas] = useState<ChamadaPendente[]>(_novas);
 
   useEffect(() => {
-    carregar();
+    iniciarCanal();
 
-    // Realtime: escuta novas chamadas — todos os listeners ANTES do subscribe()
-    const channel = supabase.channel("chamadas-garcom-realtime");
+    const listener: Listener = (c, n) => {
+      setChamadas(c);
+      setNovasChamadas(n);
+    };
+    _listeners.push(listener);
 
-    channel.on(
-      "postgres_changes",
-      { event: "INSERT", schema: "public", table: "chamadas_garcom" },
-      (payload) => {
-        const nova = payload.new as ChamadaPendente;
-        if (nova.status !== "pendente") return;
-
-        setChamadas(prev => prev.find(c => c.id === nova.id) ? prev : [...prev, nova]);
-        setNovasChamadas(prev => [...prev, nova]);
-        tocarAlerta(3);
-
-        if ("Notification" in window && Notification.permission === "granted") {
-          new Notification(`🔔 Mesa ${nova.mesa_numero} está chamando!`, {
-            body: nova.cliente_nome ? `Cliente: ${nova.cliente_nome}` : "Toque para atender",
-            icon: "/icon-192x192.png",
-          });
-        }
-
-        setTimeout(() => {
-          setNovasChamadas(prev => prev.filter(c => c.id !== nova.id));
-        }, 25000);
-      }
-    );
-
-    channel.on(
-      "postgres_changes",
-      { event: "UPDATE", schema: "public", table: "chamadas_garcom" },
-      (payload) => {
-        const updated = payload.new as { id: string; status: string };
-        if (updated.status !== "pendente") {
-          setChamadas(prev => prev.filter(c => c.id !== updated.id));
-          setNovasChamadas(prev => prev.filter(c => c.id !== updated.id));
-        }
-      }
-    );
-
-    channel.subscribe();
-
-    channelRef.current = channel;
+    // Sincroniza estado atual
+    setChamadas([..._chamadas]);
+    setNovasChamadas([..._novas]);
 
     return () => {
-      channel.unsubscribe();
+      _listeners = _listeners.filter(l => l !== listener);
     };
-  }, [carregar]);
+  }, []);
 
   const atender = useCallback(async (id: string) => {
-    await atenderChamada(id, sessaoId.current);
-    setChamadas(prev => prev.filter(c => c.id !== id));
-    setNovasChamadas(prev => prev.filter(c => c.id !== id));
+    const sessaoRaw = localStorage.getItem("sp_session_v2") || sessionStorage.getItem("sp_session_v2");
+    const sessaoId = sessaoRaw ? JSON.parse(sessaoRaw)?.id : null;
+    await atenderChamada(id, sessaoId);
+    _chamadas = _chamadas.filter(c => c.id !== id);
+    _novas = _novas.filter(c => c.id !== id);
+    notificar();
   }, []);
 
   const atenderTodas = useCallback(async () => {
-    await atenderTodasChamadas(sessaoId.current);
-    setChamadas([]);
-    setNovasChamadas([]);
+    const sessaoRaw = localStorage.getItem("sp_session_v2") || sessionStorage.getItem("sp_session_v2");
+    const sessaoId = sessaoRaw ? JSON.parse(sessaoRaw)?.id : null;
+    await atenderTodasChamadas(sessaoId);
+    _chamadas = [];
+    _novas = [];
+    notificar();
   }, []);
 
   const pedirPermissao = useCallback(async () => {
     if (!("Notification" in window)) return false;
     if (Notification.permission === "granted") return true;
-    const result = await Notification.requestPermission();
-    return result === "granted";
+    return (await Notification.requestPermission()) === "granted";
+  }, []);
+
+  const recarregar = useCallback(async () => {
+    const data = await getChamadasPendentes();
+    _chamadas = data as ChamadaPendente[];
+    notificar();
   }, []);
 
   return {
@@ -135,6 +170,6 @@ export function useChamadasGarcom() {
     atender,
     atenderTodas,
     pedirPermissao,
-    recarregar: carregar,
+    recarregar,
   };
 }
